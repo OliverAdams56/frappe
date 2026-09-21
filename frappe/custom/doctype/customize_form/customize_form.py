@@ -28,6 +28,8 @@ from frappe.utils import cint
 
 
 class CustomizeForm(Document):
+	_DOCTYPE_NAME = "Customize Form"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -258,6 +260,8 @@ class CustomizeForm(Document):
 			frappe.msgprint(_("{0} updated").format(_(self.doc_type)), alert=True)
 		frappe.clear_cache(doctype=self.doc_type)
 		self.fetch_to_customize()
+
+		frappe.publish_realtime("doctype_update", {"doctype": self.doc_type}, after_commit=True)
 
 		if self.flags.rebuild_doctype_for_global_search:
 			frappe.enqueue(
@@ -777,6 +781,8 @@ docfield_properties = {
 	"print_width": "Data",
 	"alignment": "Select",
 	"non_negative": "Check",
+	"min_value": "Float",
+	"max_value": "Float",
 	"reqd": "Check",
 	"unique": "Check",
 	"ignore_user_permissions": "Check",
@@ -786,6 +792,7 @@ docfield_properties = {
 	"in_preview": "Check",
 	"bold": "Check",
 	"no_copy": "Check",
+	"ignore_versioning": "Check",
 	"ignore_xss_filter": "Check",
 	"hidden": "Check",
 	"collapsible": "Check",

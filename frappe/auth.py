@@ -2,6 +2,7 @@
 # MIT License. See LICENSE
 import base64
 import binascii
+import hmac
 from urllib.parse import quote, unquote, urlencode, urlparse
 
 from werkzeug.wrappers import Response
@@ -25,8 +26,9 @@ from frappe.utils import cint, date_diff, datetime, get_datetime, today
 from frappe.utils.password import check_password, get_decrypted_password
 from frappe.website.utils import get_home_page
 
-SAFE_HTTP_METHODS = frozenset(("GET", "HEAD", "OPTIONS"))
+SAFE_HTTP_METHODS = frozenset(("GET", "HEAD", "OPTIONS", "QUERY"))
 UNSAFE_HTTP_METHODS = frozenset(("POST", "PUT", "DELETE", "PATCH"))
+assert SAFE_HTTP_METHODS.isdisjoint(UNSAFE_HTTP_METHODS), "a HTTP method cannot be both safe and unsafe"
 MAX_PASSWORD_SIZE = 512
 
 
@@ -239,6 +241,9 @@ class LoginManager:
 
 		# reset user if changed to Guest
 		self.user = frappe.local.session_obj.user
+		assert isinstance(self.user, str) and self.user, (
+			"session must always resolve to a non-empty user name"
+		)
 		frappe.local.session = frappe.local.session_obj.data
 		self.clear_active_sessions()
 		if not resume:
@@ -298,6 +303,7 @@ class LoginManager:
 			user_tracker and user_tracker.add_success_attempt()
 			ip_tracker and ip_tracker.add_success_attempt()
 		self.user = user.name
+		assert self.user, "authenticated user name must be set after successful authentication"
 
 	def force_user_to_reset_password(self):
 		if not self.user:
@@ -411,12 +417,13 @@ class CookieManager:
 		max_age=None,
 		deduplicate=False,
 	):
-		if not secure and hasattr(frappe.local, "request"):
-			secure = frappe.local.request.scheme == "https"
+		request = getattr(frappe.local, "request", None)
+		if not secure and request is not None:
+			secure = request.scheme == "https"
 		if (
 			deduplicate
 			and not (expires or max_age)
-			and (request := getattr(frappe.local, "request", None))
+			and request is not None
 			and unquote(request.cookies.get(key, "")) == value
 		):
 			return
@@ -475,9 +482,8 @@ def validate_ip_address(user):
 	Certain methods called from our socketio backend need direct access, and so the IP is not
 	checked for those
 	"""
-	if hasattr(frappe.local, "request") and frappe.local.request.path.startswith(
-		"/api/method/frappe.realtime."
-	):
+	request = getattr(frappe.local, "request", None)
+	if request is not None and request.path.startswith("/api/method/frappe.realtime."):
 		return True
 
 	user_info = frappe.get_cached_doc("User", user)
@@ -638,17 +644,48 @@ def validate_auth():
 	Authenticate and sets user for the request.
 	"""
 	authorization_header = frappe.get_request_header("Authorization", "").split(" ")
+	user_before_auth = frappe.session.user
+	oauth_client_auth = _is_oauth_client_auth(authorization_header)
 
 	if len(authorization_header) == 2:
 		validate_oauth(authorization_header)
-		validate_auth_via_api_keys(authorization_header)
+		if not oauth_client_auth:
+			validate_auth_via_api_keys(authorization_header)
 
 	validate_auth_via_hooks()
 
 	# If login via bearer, basic or keypair didn't work then authentication failed and we
 	# should terminate here.
-	if len(authorization_header) == 2 and frappe.session.user in ("", "Guest"):
+	if len(authorization_header) == 2 and not oauth_client_auth and frappe.session.user in ("", "Guest"):
 		raise frappe.AuthenticationError
+
+	# `restrict_ip` is enforced for interactive logins in `LoginManager.post_login` and for
+	# cookie-based requests in `Session.resume`. A request authenticated here takes neither
+	# path, so the allowlist has to be enforced explicitly - without this, API keys, tokens
+	# and bearer tokens bypass the user's IP restrictions entirely.
+	if frappe.session.user != user_before_auth and frappe.session.user not in ("", "Guest"):
+		validate_ip_address(frappe.session.user)
+
+
+def _is_oauth_client_auth(authorization_header) -> bool:
+	"""True if the request carries OAuth client credentials, which OAuthLib authenticates itself.
+
+	Matched on the resolved method name so that every route form is covered: `/api/method/<m>`,
+	`/api/v1/method/<m>`, `/api/v2/method/<m>`, each with an optional trailing slash, and the
+	deprecated `?cmd=<m>`. A false positive only leaves the session as Guest, never grants access.
+	"""
+	from frappe.integrations.oauth2 import ENDPOINTS
+
+	if len(authorization_header) != 2 or authorization_header[0].lower() != "basic":
+		return False
+
+	client_auth_methods = {
+		ENDPOINTS["token_endpoint"].rpartition("/")[2],
+		ENDPOINTS["revocation_endpoint"].rpartition("/")[2],
+	}
+	return bool(
+		client_auth_methods & {frappe.request.path.removesuffix("/").rpartition("/")[2], frappe.form_dict.cmd}
+	)
 
 
 def validate_oauth(authorization_header):
@@ -659,6 +696,7 @@ def validate_oauth(authorization_header):
 	        authorization_header (list of str): The 'Authorization' header containing the prefix and token
 	"""
 
+	from frappe.integrations.doctype.oauth_bearer_token.oauth_bearer_token import get_oauth_token_hash
 	from frappe.integrations.oauth2 import get_oauth_server
 	from frappe.oauth import get_url_delimiter
 
@@ -678,15 +716,20 @@ def validate_oauth(authorization_header):
 		body = None
 
 	try:
-		required_scopes = frappe.db.get_value("OAuth Bearer Token", token, "scopes").split(
-			get_url_delimiter()
+		token_hash = get_oauth_token_hash(token)
+		token_filters = {"access_token": token_hash}
+		token_details = frappe.db.get_value(
+			"OAuth Bearer Token", token_filters, ("scopes", "user"), as_dict=True
 		)
+		if not token_details:
+			return
+		required_scopes = token_details.scopes.split(get_url_delimiter())
 		valid, _oauthlib_request = get_oauth_server().verify_request(
 			uri, http_method, body, headers, required_scopes
 		)
 		if valid:
-			user = frappe.db.get_value("OAuth Bearer Token", token, "user")
-			if not frappe.db.get_value("User", user, "enabled"):
+			user = token_details.user
+			if not frappe.get_cached_value("User", user, "enabled"):
 				frappe.throw(_("User {0} is disabled").format(user), frappe.AuthenticationError)
 			frappe.set_user(user)
 			frappe.local.form_dict = form_dict
@@ -737,7 +780,7 @@ def validate_api_key_secret(api_key, api_secret, frappe_authorization_source=Non
 		raise frappe.AuthenticationError
 	form_dict = frappe.local.form_dict
 	doc_secret = get_decrypted_password(doctype, docname, fieldname="api_secret", raise_exception=False)
-	if doc_secret and api_secret == doc_secret:
+	if doc_secret and hmac.compare_digest(api_secret.encode(), doc_secret.encode()):
 		if doctype == "User":
 			user = frappe.db.get_value(doctype="User", filters={"api_key": api_key}, fieldname=["name"])
 		else:

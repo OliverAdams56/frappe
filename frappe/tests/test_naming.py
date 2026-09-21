@@ -49,6 +49,15 @@ class TestNaming(IntegrationTestCase):
 		self.assertEqual(append_number_if_name_exists(DOCTYPE, note.name), f"{note.name}-1")
 		self.assertEqual(append_number_if_name_exists(DOCTYPE, TITLE, "title", "_"), f"{TITLE}_1")
 
+	@run_only_if(db_type_is.SQLITE)
+	def test_getseries_uses_an_atomic_sqlite_increment(self):
+		key = f"atomic-series-{frappe.generate_hash()}"
+		self.addCleanup(frappe.db.delete, "Series", {"name": key})
+
+		self.assertEqual(getseries(key, 5), "00001")
+		self.assertEqual(getseries(key, 5), "00002")
+		self.assertEqual(frappe.db.get_value("Series", key, "current"), 2)
+
 	def test_field_autoname_name_sync(self):
 		country = frappe.get_last_doc("Country")
 		original_name = country.name
@@ -273,6 +282,22 @@ class TestNaming(IntegrationTestCase):
 
 		self.assertEqual(current_index.get("current"), 2)
 
+		frappe.db.delete("Series", {"name": series})
+
+	def test_revert_series_date_based_cross_date(self):
+		# A date-templated series must revert against the date embedded in the name,
+		# not the current date. Deleting a doc created on a different day should still
+		# decrement that day's counter.
+		key = "PO-.YYYY.-.MM.-.DD.-.###"
+		series = "PO-2020-01-01-"
+		name = "PO-2020-01-01-005"
+		frappe.db.delete("Series", {"name": series})
+		frappe.db.sql("""INSERT INTO `tabSeries` (name, current) values (%s, 5)""", (series,))
+		revert_series_if_last(key, name)
+		current_index = frappe.db.sql(
+			"""SELECT current from `tabSeries` where name = %s""", series, as_dict=True
+		)[0]
+		self.assertEqual(current_index.get("current"), 4)
 		frappe.db.delete("Series", {"name": series})
 
 	def test_naming_for_cancelled_and_amended_doc(self):

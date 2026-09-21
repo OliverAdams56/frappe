@@ -26,11 +26,13 @@ context("Navigation", () => {
 		cy.get(".page-head").findByTitle("To Do").should("be.visible");
 		cy.clear_filters();
 		cy.call("logout");
-		cy.reload().as("reload");
-		cy.get("@reload").get(".page-card .btn-primary").contains("Login").click();
+		cy.reload();
+		cy.findByRole("button", { name: "Continue" }).click();
 		cy.location("pathname").should("eq", "/login");
 		cy.login();
-		cy.reload().as("reload");
-		cy.location("pathname").should("eq", "/desk/todo");
+		cy.visit("/desk/todo");
+		// Matched on the end, since the URL settles to the shell ToDo opened in. Asserting the
+		// bare path passed only because it is briefly true, before the shell is written in.
+		cy.location("pathname").should("match", /\/todo$/);
 	});
 });

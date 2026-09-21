@@ -32,13 +32,21 @@ frappe.ui.form.Form = class FrappeForm {
 		this.refresh_if_stale_for = 120;
 		this.opendocs = {};
 		this.custom_buttons = {};
+		this.$intro_message = null;
 		this.sections = [];
 		this.grids = [];
 		this.cscript = new frappe.ui.form.Controller({ frm: this });
 		this.events = {};
 		this.fetch_dict = {};
 		this.parent = parent;
-		this.doctype_layout = frappe.get_meta(doctype_layout_name);
+		// frappe.get_doc (not frappe.get_meta) because the layout doc is loaded via
+		// frappe.model.with_doc; also guards against a stale name from a prior navigation.
+		this.doctype_layout = (() => {
+			if (!doctype_layout_name) return null;
+			const layout = frappe.get_doc("DocType Layout", doctype_layout_name);
+			if (layout && layout.document_type === doctype) return layout;
+			return null;
+		})();
 		this.undo_manager = new UndoManager({ frm: this });
 		this.setup_meta(doctype);
 		this.debounced_reload_doc = frappe.utils.debounce(this.reload_doc.bind(this), 1000);
@@ -538,6 +546,7 @@ frappe.ui.form.Form = class FrappeForm {
 			// reset page number to 1
 			grid_obj.grid.grid_pagination.go_to_page(1, true);
 		});
+		this.layout?.sections.forEach((section) => (section.expanded_by_user = false));
 		frappe.ui.form.close_grid_form();
 		this.viewers && this.viewers.parent.empty();
 		this.docname = docname;
@@ -617,17 +626,13 @@ frappe.ui.form.Form = class FrappeForm {
 			this.layout.show_message();
 
 			frappe.run_serially([
-				// header must be refreshed before client methods
-				// because add_custom_button
+				// resolve layout before toolbar and fields render
+				() => this._resolve_layout(),
 				() => this.refresh_header(switched),
-				// trigger global trigger
-				// to use this
 				() => $(document).trigger("form-refresh", [this]),
-				// fields
 				() => this.refresh_fields(),
-				// call trigger
 				() => this.script_manager.trigger("refresh"),
-				// call onload post render for callbacks to be fired
+				() => this.apply_layout_defaults(),
 				() => {
 					if (this.cscript.is_onload) {
 						this.onload_post_render();
@@ -651,6 +656,116 @@ frappe.ui.form.Form = class FrappeForm {
 				this.scroll_to_element();
 			});
 		});
+	}
+
+	/**
+	 * Evaluate layout conditions against the current doc.
+	 * Finds the first layout whose condition is truthy, reflects it in the
+	 * `layout` URL param, rebuilds the layout DOM if it changed, then the
+	 * existing refresh chain picks up the new layout.
+	 * Returns a Promise so frappe.run_serially awaits it.
+	 */
+	_resolve_layout() {
+		// Guard against re-entrancy (model.set_value can trigger another refresh)
+		if (this._resolving_layout) return;
+
+		const layouts = (frappe.boot.doctype_layouts || []).filter(
+			(l) => l.document_type === this.doctype && l.condition
+		);
+		if (!layouts.length) return;
+
+		let matched = null;
+		for (const l of layouts) {
+			try {
+				// eslint-disable-next-line no-new-func
+				const result = new Function("doc", `return !!(${l.condition})`)(this.doc);
+				if (result) {
+					matched = l;
+					break;
+				}
+			} catch (e) {
+				console.warn(`DocType Layout condition error (${l.name}):`, e);
+			}
+		}
+		const matched_name = matched ? matched.name : null;
+		const rendered_name = this.doctype_layout?.name || null;
+
+		const _url = new URL(window.location.href);
+		if (matched_name) {
+			_url.searchParams.set("layout", matched_name);
+		} else {
+			_url.searchParams.delete("layout");
+		}
+		history.replaceState(history.state, "", _url.toString());
+
+		if (matched_name === rendered_name) return;
+
+		const apply = (layout_doc) => {
+			this.doctype_layout = layout_doc || null;
+			this._rebuild_layout();
+		};
+
+		if (!matched_name) {
+			apply(null);
+			return;
+		}
+
+		return new Promise((resolve) => {
+			this._resolving_layout = true;
+			frappe.model.with_doc("DocType Layout", matched_name, () => {
+				apply(frappe.get_doc("DocType Layout", matched_name));
+				this._resolving_layout = false;
+				resolve();
+			});
+		});
+	}
+
+	_rebuild_layout() {
+		const old_wrapper = this.layout.wrapper;
+		this.grids = [];
+		const $dashboard = $(this.dashboard?.parent).detach();
+		this.layout = new frappe.ui.form.Layout({
+			parent: this.body,
+			doctype: this.doctype,
+			doctype_layout: this.doctype_layout,
+			frm: this,
+			with_dashboard: true,
+			card_layout: true,
+		});
+		this.layout.make();
+
+		let dashboard_added = false;
+		if (this.layout.tabs.length) {
+			this.layout.tabs.every((tab) => {
+				if (tab.df.show_dashboard) {
+					tab.wrapper.prepend($dashboard);
+					dashboard_added = true;
+					return false;
+				}
+				return true;
+			});
+			if (!dashboard_added) {
+				this.layout.tabs[0].wrapper.prepend($dashboard);
+			}
+		} else {
+			this.layout.wrapper.find(".form-page").prepend($dashboard);
+		}
+
+		old_wrapper.remove();
+
+		if (this.active_tab_map) delete this.active_tab_map[this.docname];
+
+		this.layout.doc = this.doc;
+		this.layout.attach_doc_and_docfields();
+		this.layout.set_tab_as_active();
+		this.fields_dict = this.layout.fields_dict;
+		this.fields = this.layout.fields_list;
+	}
+
+	apply_layout_defaults() {
+		const layout = this.doctype_layout;
+		this._layout_print_format = layout?.default_print_format || null;
+		this._layout_email_template = layout?.default_email_template || null;
 	}
 
 	onload_post_render() {
@@ -778,6 +893,11 @@ frappe.ui.form.Form = class FrappeForm {
 		this.viewers.refresh();
 
 		this.dashboard.refresh();
+		const _route_key = frappe.breadcrumbs.current_page();
+		const _crumb = frappe.breadcrumbs.all[_route_key];
+		if (_crumb) {
+			_crumb.layout_name = this.doctype_layout?.name || null;
+		}
 		frappe.breadcrumbs.update();
 
 		this.show_submit_message();
@@ -802,7 +922,10 @@ frappe.ui.form.Form = class FrappeForm {
 	save(save_action, callback, btn, on_error) {
 		let me = this;
 		return new Promise((resolve, reject) => {
-			btn && $(btn).prop("disabled", true);
+			// aria-busy mirrors the disabled handling here and in save.js —
+			// see the note in frappe.ui.form.save (this promise doesn't settle
+			// on every validation-error path)
+			btn && $(btn).prop("disabled", true).attr("aria-busy", "true");
 			frappe.ui.form.close_grid_form();
 			me.validate_and_save(save_action, callback, btn, on_error, resolve, reject);
 		})
@@ -854,7 +977,7 @@ frappe.ui.form.Form = class FrappeForm {
 			if (e) {
 				console.error(e);
 			}
-			btn && $(btn).prop("disabled", false);
+			btn && $(btn).prop("disabled", false).removeAttr("aria-busy");
 			if (on_error) {
 				on_error();
 				reject();
@@ -948,13 +1071,17 @@ frappe.ui.form.Form = class FrappeForm {
 				method: "frappe.desk.form.linked_with.get_submitted_linked_docs",
 				args: {
 					doctype: me.doc.doctype,
-					name: me.doc.name,
+					name: cstr(me.doc.name),
 					ignore_doctypes_on_cancel_all: me.ignore_doctypes_on_cancel_all,
 				},
 				freeze: true,
 			})
 			.then((r) => {
 				if (!r.exc) {
+					if (r.message.truncated) {
+						return me._cancel_all_in_background(btn, on_error);
+					}
+
 					let doctypes_to_cancel = (r.message.docs || []).map((value) => {
 						return value.doctype;
 					});
@@ -967,26 +1094,55 @@ frappe.ui.form.Form = class FrappeForm {
 			});
 	}
 
+	_linked_docs_list_html(links) {
+		// never render an absurdly long list; the count carries the scale
+		const max_names_per_doctype = 10;
+		let links_text = "";
+		const doctypes = Array.from(new Set(links.map((link) => link.doctype)));
+
+		for (let doctype of doctypes) {
+			const of_doctype = links.filter((link) => link.doctype == doctype);
+			let docnames = of_doctype
+				.slice(0, max_names_per_doctype)
+				.map((link) => frappe.utils.get_form_link(link.doctype, link.name, true))
+				.join(", ");
+			if (of_doctype.length > max_names_per_doctype) {
+				docnames += ", " + __("and {0} more", [of_doctype.length - max_names_per_doctype]);
+			}
+			links_text += `<li><strong>${__(doctype)}</strong>: ${docnames}</li>`;
+		}
+		return `<ul>${links_text}</ul>`;
+	}
+
+	_cancel_all_in_background(btn, on_error) {
+		const me = this;
+		const d = frappe.warn(
+			__("Confirm"),
+			__(
+				"{0} {1} is linked with too many submitted documents to list. Cancel all of them in the background along with {1}? You will be notified when it completes.",
+				[__(me.doc.doctype).bold(), cstr(me.doc.name).bold()]
+			),
+			() => me._cancel_with_linked_docs(null, btn, null, on_error),
+			__("Cancel All")
+		);
+		d.onhide = () => {
+			if (!d.primary_action_fulfilled) {
+				me.handle_save_fail(btn, on_error);
+			}
+		};
+	}
+
 	_cancel_all(r, btn, callback, on_error) {
 		const me = this;
 
 		// add confirmation message for cancelling all linked docs
-		let links_text = "";
 		let links = r.message.docs;
-		const doctypes = Array.from(new Set(links.map((link) => link.doctype)));
 
 		me.ignore_doctypes_on_cancel_all = me.ignore_doctypes_on_cancel_all || [];
 
-		for (let doctype of doctypes) {
-			if (!me.ignore_doctypes_on_cancel_all.includes(doctype)) {
-				let docnames = links
-					.filter((link) => link.doctype == doctype)
-					.map((link) => frappe.utils.get_form_link(link.doctype, link.name, true))
-					.join(", ");
-				links_text += `<li><strong>${__(doctype)}</strong>: ${docnames}</li>`;
-			}
-		}
-		links_text = `<ul>${links_text}</ul>`;
+		let links_text = me._linked_docs_list_html(
+			links.filter((link) => !me.ignore_doctypes_on_cancel_all.includes(link.doctype))
+		);
 
 		let confirm_message = __("{0} {1} is linked with the following submitted documents: {2}", [
 			__(me.doc.doctype).bold(),
@@ -1005,38 +1161,68 @@ frappe.ui.form.Form = class FrappeForm {
 		let d = new frappe.ui.Dialog(
 			{
 				title: __("Cancel All Documents"),
-				fields: [
-					{
-						fieldtype: "HTML",
-						options: `<p class="frappe-confirm-message">${confirm_message}</p>`,
-					},
-				],
+				fields: [{ fieldtype: "HTML", fieldname: "message" }],
 			},
 			() => me.handle_save_fail(btn, on_error)
+		);
+		// set directly: HTML field options get template-rendered, and names are user input
+		d.fields_dict.message.$wrapper.html(
+			`<p class="frappe-confirm-message">${confirm_message}</p>`
 		);
 
 		// if user can cancel all linked docs, add action to the dialog
 		if (can_cancel) {
 			d.set_primary_action(__("Cancel All"), () => {
 				d.hide();
-				frappe.call({
-					method: "frappe.desk.form.linked_with.cancel_all_linked_docs",
-					args: {
-						docs: links,
-						ignore_doctypes_on_cancel_all: me.ignore_doctypes_on_cancel_all || [],
-					},
-					freeze: true,
-					callback: (resp) => {
-						if (!resp.exc) {
-							me.reload_doc();
-							me._cancel(btn, callback, on_error, true);
-						}
-					},
-				});
+				me._cancel_with_linked_docs(links, btn, callback, on_error);
 			});
 		}
 
 		d.show();
+	}
+
+	_cancel_with_linked_docs(links, btn, callback, on_error) {
+		const me = this;
+		const args = {
+			ignore_doctypes_on_cancel_all: me.ignore_doctypes_on_cancel_all || [],
+			root_doctype: me.doc.doctype,
+			root_name: cstr(me.doc.name),
+		};
+		if (links) {
+			// without a list the server discovers the graph in a background job
+			args.docs = links;
+		}
+		frappe.validated = true;
+		me.script_manager.trigger("before_cancel").then(() => {
+			if (!frappe.validated) {
+				return me.handle_save_fail(btn, on_error);
+			}
+			frappe.call({
+				method: "frappe.desk.form.linked_with.cancel_all_linked_docs",
+				args: args,
+				freeze: true,
+				callback: (resp) => {
+					if (resp.exc) {
+						return me.handle_save_fail(btn, on_error);
+					}
+					if (resp.message && resp.message.queued) {
+						frappe.msgprint(
+							__(
+								"The linked documents will be cancelled in the background along with {0}. You will be notified when it completes.",
+								[cstr(me.doc.name).bold()]
+							)
+						);
+						return;
+					}
+					// the server cancelled the root along with its links
+					me.reload_doc().then(() => {
+						frappe.utils.play_sound("cancel");
+						callback && callback();
+						me.script_manager.trigger("after_cancel");
+					});
+				},
+			});
+		});
 	}
 
 	_cancel(btn, callback, on_error, skip_confirm) {
@@ -1065,11 +1251,23 @@ frappe.ui.form.Form = class FrappeForm {
 		if (skip_confirm) {
 			cancel_doc();
 		} else {
-			frappe.confirm(
+			// destructive: red primary via frappe.warn
+			const d = frappe.warn(
+				__("Confirm"),
 				__("Permanently Cancel {0}?", [this.docname]),
 				cancel_doc,
-				me.handle_save_fail(btn, on_error)
+				__("Yes"),
+				false,
+				__("No")
 			);
+			// declined (No / Escape / close): re-enable the button. A
+			// confirmed-but-failed cancellation calls handle_save_fail from
+			// inside cancel_doc — this must not double up with that.
+			d.onhide = () => {
+				if (!d.primary_action_fulfilled) {
+					me.handle_save_fail(btn, on_error);
+				}
+			};
 		}
 	}
 
@@ -1120,10 +1318,108 @@ frappe.ui.form.Form = class FrappeForm {
 	}
 
 	savetrash() {
+		const me = this;
 		this.validate_form_action("Delete");
+		frappe
+			.call({
+				method: "frappe.desk.form.linked_with.get_linked_docs_to_delete",
+				args: {
+					doctype: me.doctype,
+					name: cstr(me.docname),
+				},
+				freeze: true,
+			})
+			.then((r) => {
+				if (!r.exc && r.message.truncated) {
+					return me._delete_all_in_background();
+				}
+				if (!r.exc && (r.message.docs || []).length) {
+					return me._delete_all(r);
+				}
+				me._delete();
+			});
+	}
+
+	_delete() {
 		frappe.model.delete_doc(this.doctype, this.docname, function () {
 			window.history.back();
 		});
+	}
+
+	_delete_all_in_background() {
+		const me = this;
+		frappe.warn(
+			__("Confirm"),
+			__(
+				"{0} {1} is linked with too many documents to list. Delete all of them in the background along with {1}? You will be notified when it completes.",
+				[__(me.doctype).bold(), cstr(me.docname).bold()]
+			),
+			() => me._delete_with_linked_docs(null),
+			__("Delete All")
+		);
+	}
+
+	_delete_with_linked_docs(links) {
+		const me = this;
+		const args = { root_doctype: me.doctype, root_name: cstr(me.docname) };
+		if (links) {
+			// without a list the server discovers the graph in a background job
+			args.docs = links;
+		}
+		frappe.call({
+			method: "frappe.desk.form.linked_with.delete_all_linked_docs",
+			args: args,
+			freeze: true,
+			freeze_message: __("Deleting documents..."),
+			callback: (resp) => {
+				if (resp.exc) {
+					return;
+				}
+				if (resp.message && resp.message.queued) {
+					frappe.msgprint(
+						__(
+							"The linked documents will be deleted in the background along with {0}. You will be notified when it completes.",
+							[cstr(me.docname).bold()]
+						)
+					);
+					return;
+				}
+				// the server deleted the root along with its links
+				frappe.utils.play_sound("delete");
+				frappe.model.delete_from_locals(me.doctype, me.docname);
+				window.history.back();
+			},
+		});
+	}
+
+	_delete_all(r) {
+		const me = this;
+		const links = r.message.docs;
+
+		let confirm_message = __("{0} {1} is linked with the following documents: {2}", [
+			__(me.doctype).bold(),
+			me.docname,
+			me._linked_docs_list_html(links),
+		]);
+		confirm_message += __("Do you want to delete {0} along with all linked documents?", [
+			cstr(me.docname).bold(),
+		]);
+
+		const d = new frappe.ui.Dialog({
+			title: __("Delete All Documents"),
+			fields: [{ fieldtype: "HTML", fieldname: "message" }],
+		});
+		// set directly: HTML field options get template-rendered, and names are user input
+		d.fields_dict.message.$wrapper.html(
+			`<p class="frappe-confirm-message">${confirm_message}</p>`
+		);
+
+		d.set_primary_action(__("Delete All"), () => {
+			d.hide();
+			me._delete_with_linked_docs(links);
+		});
+
+		d.show();
 	}
 
 	amend_doc() {
@@ -1221,7 +1517,7 @@ frappe.ui.form.Form = class FrappeForm {
 	}
 
 	handle_save_fail(btn, on_error) {
-		$(btn).prop("disabled", false);
+		$(btn).prop("disabled", false).removeAttr("aria-busy");
 		if (on_error) {
 			on_error();
 		}
@@ -1293,6 +1589,8 @@ frappe.ui.form.Form = class FrappeForm {
 	}
 
 	add_web_link(path, label) {
+		if (!this.sidebar) return;
+
 		label = __(label) || __("See on Website");
 		this.web_link = this.sidebar
 			.add_user_action(__(label), function () {})
@@ -1377,6 +1675,10 @@ frappe.ui.form.Form = class FrappeForm {
 		frappe.route_options = {
 			frm: this,
 		};
+		// Use layout default print format if one is set
+		if (this._layout_print_format) {
+			frappe.route_options.print_format = this._layout_print_format;
+		}
 		frappe.set_route("print", this.doctype, this.doc.name);
 	}
 
@@ -1409,10 +1711,17 @@ frappe.ui.form.Form = class FrappeForm {
 			.call({ method: "frappe.desk.form.utils.get_next", args, freeze: true })
 			.then((r) => {
 				if (r.message) {
+					frappe.route_hash = this.get_active_tab_hash();
 					frappe.set_route("Form", this.doctype, r.message);
 					this.focus_on_first_input();
 				}
 			});
+	}
+
+	get_active_tab_hash() {
+		const fieldname = this.get_active_tab()?.df?.fieldname;
+		if (!fieldname || fieldname === "__details") return "";
+		return "#" + fieldname;
 	}
 
 	rename_doc() {
@@ -1431,6 +1740,8 @@ frappe.ui.form.Form = class FrappeForm {
 			recipients: this.doc.email || this.doc.email_id || this.doc.contact_email,
 			attach_document_print: true,
 			message: message,
+			// Use layout default email template if one is set
+			email_template: this._layout_email_template || undefined,
 		});
 	}
 
@@ -1521,7 +1832,13 @@ frappe.ui.form.Form = class FrappeForm {
 	}
 
 	set_intro(txt, color) {
-		this.dashboard.set_headline_alert(txt, color);
+		if (this.$intro_message) {
+			this.$intro_message.remove();
+			this.$intro_message = null;
+		}
+		if (txt) {
+			this.$intro_message = this.dashboard.set_headline_alert(txt, color);
+		}
 	}
 
 	set_footnote(txt) {
@@ -1584,11 +1901,12 @@ frappe.ui.form.Form = class FrappeForm {
 				history.replaceState(null, null, url);
 			}
 		} else if (window.location.hash) {
-			if ($(window.location.hash).length) {
-				frappe.utils.scroll_to(window.location.hash, true, 200, null, null, true);
-			} else {
-				this.scroll_to_field(window.location.hash.replace("#", "")) &&
-					history.replaceState(null, null, " ");
+			const id = decodeURIComponent(window.location.hash.substring(1));
+			const element = id && document.getElementById(id);
+			if (element) {
+				frappe.utils.scroll_to(element, true, 200, null, null, true);
+			} else if (id) {
+				this.scroll_to_field(id) && history.replaceState(null, null, " ");
 			}
 		}
 	}
@@ -1618,13 +1936,16 @@ frappe.ui.form.Form = class FrappeForm {
 		$.each(fields_list, function (i, fname) {
 			var docfield = frappe.meta.docfield_map[doctype][fname];
 			if (docfield) {
-				var label = __(docfield.label || "", null, docfield.parent).replace(
-					/\([^\)]*\)/g,
-					""
-				); // eslint-disable-line
+				// Preserve the pristine label before any currency suffix is applied,
+				// so we don't have to strip it back out of a mutated value on reset
+				// (which would also destroy legitimate parentheticals like "Rate (ex-tax)").
+				if (docfield._original_label === undefined) {
+					docfield._original_label = docfield.label;
+				}
+				var label = __(docfield._original_label || "", null, docfield.parent);
 				if (parentfield) {
 					grid_field_label_map[doctype + "-" + fname] =
-						label.trim() + " (" + __(currency) + ")";
+						label.trim() + " (" + currency + ")";
 				} else {
 					field_label_map[fname] = label.trim() + " (" + currency + ")";
 				}
@@ -1638,6 +1959,35 @@ frappe.ui.form.Form = class FrappeForm {
 		$.each(grid_field_label_map, function (fname, label) {
 			fname = fname.split("-");
 			me.fields_dict[parentfield].grid.update_docfield_property(fname[1], "label", label);
+		});
+	}
+
+	reset_currency_labels(fields, parentfield) {
+		if (!fields.length) return;
+
+		const doctype = parentfield
+			? this.fields_dict[parentfield].grid.doctype
+			: this.doc.doctype;
+
+		fields.forEach((field) => {
+			const docfield = frappe.meta.docfield_map[doctype][field];
+			if (docfield) {
+				// Read the pristine label captured by set_currency_labels (or here on first use)
+				if (docfield._original_label === undefined) {
+					docfield._original_label = docfield.label;
+				}
+				const label = __(docfield._original_label || "", null, docfield.parent);
+
+				if (parentfield) {
+					this.fields_dict[parentfield].grid.update_docfield_property(
+						field,
+						"label",
+						label
+					);
+				} else {
+					this.fields_dict[field].set_label(label);
+				}
+			}
 		});
 	}
 
@@ -2041,26 +2391,29 @@ frappe.ui.form.Form = class FrappeForm {
 	}
 
 	set_link_field(doctype, new_doc, fieldname) {
-		let me = this;
-		frappe.get_meta(doctype).fields.forEach(function (df) {
-			const isLinkToParent = df.fieldtype === "Link" && df.options === me.doctype;
+		const fields = frappe.get_meta(doctype).fields;
+		const links_to_parent = (df) => df.fieldtype === "Link" && df.options === this.doctype;
 
-			if (fieldname) {
-				if (df.fieldname === fieldname && isLinkToParent) {
-					new_doc[df.fieldname] = me.doc.name;
-				}
-				if (df.fieldtype === "Table" && df.options && df.reqd) {
-					me.set_link_field(df.options, new_doc[df.fieldname][0]);
-				}
+		if (fieldname) {
+			if (fields.some((df) => df.fieldname === fieldname && links_to_parent(df))) {
+				new_doc[fieldname] = this.doc.name;
 				return;
 			}
 
-			if (isLinkToParent) {
-				new_doc[df.fieldname] = me.doc.name;
-			} else if (["Link", "Dynamic Link"].includes(df.fieldtype) && me.doc[df.fieldname]) {
-				new_doc[df.fieldname] = me.doc[df.fieldname];
+			// link is not on the parent, look for it in a mandatory child table
+			fields
+				.filter((df) => df.fieldtype === "Table" && df.options && df.reqd)
+				.forEach((df) => this.set_link_field(df.options, new_doc[df.fieldname][0]));
+			return;
+		}
+
+		fields.forEach((df) => {
+			if (links_to_parent(df)) {
+				new_doc[df.fieldname] = this.doc.name;
+			} else if (["Link", "Dynamic Link"].includes(df.fieldtype) && this.doc[df.fieldname]) {
+				new_doc[df.fieldname] = this.doc[df.fieldname];
 			} else if (df.fieldtype === "Table" && df.options && df.reqd) {
-				me.set_link_field(df.options, new_doc[df.fieldname][0]);
+				this.set_link_field(df.options, new_doc[df.fieldname][0]);
 			}
 		});
 	}
@@ -2138,7 +2491,7 @@ frappe.ui.form.Form = class FrappeForm {
 				!doc.reference_doctype ||
 				!doc.reference_name ||
 				doc.reference_doctype !== doctype ||
-				doc.reference_name !== docname
+				cstr(doc.reference_name) !== cstr(docname)
 			) {
 				return;
 			}
@@ -2160,6 +2513,10 @@ frappe.ui.form.Form = class FrappeForm {
 			}
 
 			this.timeline && this.timeline.refresh();
+
+			if (key === "attachments") {
+				this.attachments && this.attachments.refresh();
+			}
 
 			if (["add", "delete"].includes(action) && doc.doctype === "Comment") {
 				this.footer.refresh_comments_count();

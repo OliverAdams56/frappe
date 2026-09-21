@@ -35,6 +35,8 @@ from frappe.utils.xlsxutils import make_xlsx
 
 
 class AutoEmailReport(Document):
+	_DOCTYPE_NAME = "Auto Email Report"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -204,7 +206,7 @@ class AutoEmailReport(Document):
 			if len(columns) > 8:
 				options["orientation"] = "landscape"
 			html = get_formatted_html(subject=self.name, message=self.get_html_table(columns, data))
-			return get_pdf(html, options)
+			return get_pdf(html, options, smart_shrinking=True)
 
 		else:
 			frappe.throw(_("Invalid Output Format"))

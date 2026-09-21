@@ -5,8 +5,16 @@ from typing import ClassVar
 from unittest.mock import patch
 
 import frappe
-from frappe.search.sqlite_search import SQLiteSearch, SQLiteSearchIndexMissingError, index_docs_in_queue
+from frappe.search.sqlite_search import (
+	SQLiteSearch,
+	SQLiteSearchIndexMissingError,
+	_build_lock_name,
+	build_index,
+	build_index_if_not_exists,
+	index_docs_in_queue,
+)
 from frappe.tests import IntegrationTestCase
+from frappe.utils.synchronization import filelock
 
 
 class TestSQLiteSearch(SQLiteSearch):
@@ -110,6 +118,36 @@ class TestSQLiteSearchAPI(IntegrationTestCase):
 				pass
 
 		super().tearDown()
+
+	def test_build_index_creates_a_missing_index(self):
+		"""build_index_if_not_exists passes force=False, so that path has to build."""
+		self.search.drop_index()
+		self.addCleanup(self.search.drop_index)
+
+		build_index(TestSQLiteSearch, force=False)
+
+		self.assertTrue(self.search.index_exists())
+
+	def test_scheduled_builder_creates_a_missing_index(self):
+		self.search.drop_index()
+		self.addCleanup(self.search.drop_index)
+
+		with patch("frappe.search.sqlite_search.get_search_classes", return_value=[TestSQLiteSearch]):
+			build_index_if_not_exists()
+
+		self.assertTrue(self.search.index_exists())
+
+	def test_a_second_build_skips_while_one_is_running(self):
+		"""A fresh build deletes any temp database it finds, so two would delete each other's work."""
+		self.search.drop_index()
+		self.addCleanup(self.search.drop_index)
+
+		with filelock(_build_lock_name(TestSQLiteSearch), timeout=0):
+			build_index(TestSQLiteSearch, force=True)
+			self.assertFalse(self.search.index_exists())
+
+		build_index(TestSQLiteSearch, force=True)
+		self.assertTrue(self.search.index_exists())
 
 	def test_index_lifecycle_and_status_methods(self):
 		"""Test index building, existence checking, and status validation."""
@@ -684,3 +722,102 @@ class TestSQLiteSearchAPI(IntegrationTestCase):
 
 		finally:
 			test_note.delete()
+
+	def test_build_index_terminates_when_a_batch_has_no_indexable_documents(self):
+		"""build_index must advance its cursor even if nothing in a batch can be indexed.
+
+		prepare_document() may legitimately reject every document in a batch (missing text
+		fields, a subclass filtering by its own rules). The cursor used to advance only when
+		at least one document survived, so such a batch was re-fetched forever and
+		build_index() never returned - it spun at full CPU, opening a fresh SQLite connection
+		per iteration, until the process was killed.
+		"""
+		self.search.drop_index()
+
+		real_get_documents_paginated = self.search.get_documents_paginated
+		fetches = []
+
+		def counting_get_documents_paginated(*args, **kwargs):
+			fetches.append(kwargs.get("last_indexed_name"))
+			# Fail the test instead of hanging the suite if the cursor stops advancing.
+			if len(fetches) > 50:
+				raise AssertionError(
+					"build_index() re-fetched batches without advancing its cursor "
+					f"({len(fetches)} fetches for {len(self.search.doc_configs)} doctypes)"
+				)
+			return real_get_documents_paginated(*args, **kwargs)
+
+		with (
+			patch.object(TestSQLiteSearch, "prepare_document", return_value=None),
+			patch.object(self.search, "get_documents_paginated", counting_get_documents_paginated),
+		):
+			self.search.build_index()
+
+		# Every doctype is walked to exhaustion and marked complete, and nothing is indexed.
+		self.assertTrue(self.search.index_exists())
+
+		conn = sqlite3.connect(self.search.db_path)
+		try:
+			indexed_rows = conn.execute("SELECT COUNT(*) FROM search_fts").fetchone()[0]
+			incomplete = conn.execute(
+				"SELECT COUNT(*) FROM search_index_progress WHERE is_complete = 0"
+			).fetchone()[0]
+		finally:
+			conn.close()
+
+		self.assertEqual(indexed_rows, 0)
+		self.assertEqual(incomplete, 0, "every doctype should be marked complete")
+
+
+class TestStripSurrogates(IntegrationTestCase):
+	"""Unit tests for the strip_surrogates helper.
+
+	Regression test for the poison-pill bug where a Communication with mis-encoded
+	UTF-16 surrogates (e.g., from Outlook/Exchange emojis) caused
+	cursor.executemany() to fail with UnicodeEncodeError, aborting the entire
+	indexing batch and blocking the source save (email pull, doc save, etc.).
+	"""
+
+	def test_clean_text_returns_unchanged(self):
+		from frappe.search.sqlite_search import strip_surrogates
+
+		self.assertEqual(strip_surrogates("Hello, world"), "Hello, world")
+		self.assertEqual(strip_surrogates("Hello, 世界 🎉"), "Hello, 世界 🎉")
+		self.assertEqual(strip_surrogates(""), "")
+
+	def test_paired_surrogates_recover_to_real_codepoint(self):
+		"""Outlook/Exchange emojis arriving as surrogate pairs get recombined."""
+		from frappe.search.sqlite_search import strip_surrogates
+
+		# 🎉 is the UTF-16 surrogate pair for U+1F389 (🎉)
+		poisoned = chr(0xD83C) + chr(0xDF89) + " Congrats"
+		self.assertEqual(strip_surrogates(poisoned), "🎉 Congrats")
+
+	def test_orphan_surrogates_are_dropped(self):
+		from frappe.search.sqlite_search import strip_surrogates
+
+		self.assertEqual(strip_surrogates("before" + chr(0xD83C) + "after"), "beforeafter")
+		self.assertEqual(strip_surrogates("before" + chr(0xDF89) + "after"), "beforeafter")
+
+	def test_non_string_values_pass_through(self):
+		from frappe.search.sqlite_search import strip_surrogates
+
+		self.assertIsNone(strip_surrogates(None))
+		self.assertEqual(strip_surrogates(42), 42)
+		self.assertEqual(strip_surrogates(""), "")
+
+	def test_output_is_always_utf8_encodable(self):
+		"""The sanitized string must be safe for sqlite3 parameter binding."""
+		from frappe.search.sqlite_search import strip_surrogates
+
+		# Every combination that previously caused UnicodeEncodeError
+		poisoned_inputs = [
+			chr(0xD83C) + chr(0xDF89) + " Congrats",  # paired
+			"before" + chr(0xD83C) + "after",  # orphan high
+			"before" + chr(0xDF89) + "after",  # orphan low
+			chr(0xD83C) + "X" + chr(0xDF89),  # invalid pairing
+		]
+		for value in poisoned_inputs:
+			with self.assertRaises(UnicodeEncodeError):
+				value.encode("utf-8")
+			strip_surrogates(value).encode("utf-8")  # must not raise

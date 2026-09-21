@@ -51,6 +51,8 @@ def cache_email_account(cache_name):
 
 
 class EmailAccount(Document):
+	_DOCTYPE_NAME = "Email Account"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -85,7 +87,7 @@ class EmailAccount(Document):
 		default_outgoing: DF.Check
 		domain: DF.Link | None
 		dsn_notify_type: DF.Literal[
-			"SUCCESS", "FAILURE", "DELAY", "SUCCESS,FAILURE", "SUCCESS,FAILURE,DELAY", "NEVER"
+			"", "SUCCESS", "FAILURE", "DELAY", "SUCCESS,FAILURE", "SUCCESS,FAILURE,DELAY", "NEVER"
 		]
 		email_account_name: DF.Data | None
 		email_id: DF.Data
@@ -211,7 +213,9 @@ class EmailAccount(Document):
 
 		if self.notify_if_unreplied:
 			if not self.send_notification_to:
-				frappe.throw(_("{0} is mandatory").format(self.meta.get_label("send_notification_to")))
+				frappe.throw(
+					_("{0} is mandatory").format(self.meta.get_translated_label("send_notification_to"))
+				)
 			for e in self.get_unreplied_notification_emails():
 				validate_email_address(e, True)
 
@@ -404,6 +408,9 @@ class EmailAccount(Document):
 
 	def check_email_server_connection(self, email_server, in_receive):
 		# tries to connect to email server and handles failure
+		# in_receive is also set during save validation; only a real background fetch
+		# should auto-disable the account, a failed save must surface the error
+		is_background_receive = in_receive and not bool(self.flags.validate_imap_pop_connection)
 		try:
 			email_server.connect()
 
@@ -424,7 +431,7 @@ class EmailAccount(Document):
 
 			all_error_codes = auth_error_codes + other_error_codes
 
-			if in_receive and any(map(lambda t: t in message, all_error_codes)):
+			if is_background_receive and any(t in message for t in all_error_codes):
 				# if called via self.receive and it leads to authentication error,
 				# disable incoming and send email to System Manager
 				error_message = _(
@@ -436,13 +443,13 @@ class EmailAccount(Document):
 				self.handle_incoming_connect_error(description=error_message)
 				return None
 
-			elif not in_receive and any(map(lambda t: t in message, auth_error_codes)):
+			elif not is_background_receive and any(t in message for t in auth_error_codes):
 				SMTPServer.throw_invalid_credentials_exception()
 			else:
 				frappe.throw(cstr(e))
 
 		except OSError:
-			if in_receive:
+			if is_background_receive:
 				# timeout while connecting, see receive.py connect method
 				description = frappe.message_log.pop() if frappe.message_log else "Socket Error"
 				self.db_set("no_failed", self.no_failed + 1)
@@ -710,8 +717,24 @@ class EmailAccount(Document):
 					frappe.db.rollback()
 				else:
 					frappe.db.commit()
-			else:
-				frappe.db.commit()
+
+				# leave the folder behind this mail so the next pull retries it
+				continue
+
+			if mail.imap_folder:
+				sync_from_uid = cint(mail.uid) + 1
+				frappe.db.set_value(
+					"IMAP Folder",
+					{
+						"parent": self.name,
+						"folder_name": mail.imap_folder,
+						"sync_from_uid": ("<", sync_from_uid),
+					},
+					"sync_from_uid",
+					sync_from_uid,
+					update_modified=False,
+				)
+			frappe.db.commit()
 
 		if exceptions:
 			raise Exception(frappe.as_json(exceptions))
@@ -720,7 +743,7 @@ class EmailAccount(Document):
 		"""retrive and return inbound mails."""
 		mails = []
 
-		def process_mail(messages, append_to=None):
+		def process_mail(messages, append_to=None, imap_folder=None):
 			for index, message in enumerate(messages.get("latest_messages", [])):
 				uid = messages["uid_list"][index] if messages.get("uid_list") else None
 				seen_status = messages.get("seen_status", {}).get(uid)
@@ -733,6 +756,7 @@ class EmailAccount(Document):
 							frappe.safe_decode(uid),
 							seen_status,
 							append_to,
+							imap_folder,
 						)
 					)
 
@@ -753,8 +777,10 @@ class EmailAccount(Document):
 					for folder in self.imap_folder:
 						if email_server.select_imap_folder(folder.folder_name):
 							email_server.settings["uid_validity"] = folder.uidvalidity
+							email_server.settings["sync_from_uid"] = folder.sync_from_uid
+							email_server.settings["email_sync_rule"] = self.build_email_sync_rule(folder)
 							messages = email_server.get_messages(folder=f'"{folder.folder_name}"') or {}
-							process_mail(messages, folder.append_to)
+							process_mail(messages, folder.append_to, folder.folder_name)
 				else:
 					# process the pop3 account
 					messages = email_server.get_messages() or {}
@@ -820,7 +846,9 @@ class EmailAccount(Document):
 				sender=self.email_id,
 				reply_to=communication.incoming_email_account,
 				subject=" ".join([_("Re:"), communication.subject]),
-				content=render_template(self.auto_reply_message or "", communication.as_dict())
+				content=render_template(
+					self.auto_reply_message or "", communication.as_dict(), restrict_globals=True
+				)
 				or frappe.get_template("templates/emails/auto_reply.html").render(communication.as_dict()),
 				reference_doctype=communication.reference_doctype,
 				reference_name=communication.reference_name,
@@ -845,11 +873,14 @@ class EmailAccount(Document):
 	def after_rename(self, old, new, merge=False):
 		frappe.db.set_value("Email Account", new, "email_account_name", new)
 
-	def build_email_sync_rule(self):
+	def build_email_sync_rule(self, folder=None):
 		if not self.use_imap:
 			return "UNSEEN"
 
 		if self.email_sync_option == "ALL":
+			if folder and folder.sync_from_uid:
+				return f"UID {folder.sync_from_uid}:*"
+
 			max_uid = get_max_email_uid(self.name)
 			last_uid = max_uid + int(self.initial_sync_count or 100) if max_uid == 1 else "*"
 			return f"UID {max_uid}:{last_uid}"
@@ -1052,6 +1083,7 @@ def get_max_email_uid(email_account):
 			"communication_medium": "Email",
 			"sent_or_received": "Received",
 			"email_account": email_account,
+			"uid": (">", 0),
 		},
 		fields=[{"MAX": "uid", "as": "uid"}],
 	):

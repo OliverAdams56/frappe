@@ -19,7 +19,6 @@ from frappe.permissions import check_doctype_permission
 from frappe.utils import cint, get_files_path
 from frappe.utils.csvutils import build_csv_response
 from frappe.utils.deprecations import deprecated
-from frappe.utils.image import optimize_image
 from frappe.utils.response import build_response
 
 if TYPE_CHECKING:
@@ -74,6 +73,8 @@ def execute_cmd(cmd, from_async=False):
 
 	try:
 		method = get_attr(cmd)
+	except frappe.AppNotInstalledError:
+		raise
 	except Exception as e:
 		frappe.throw(_("Failed to get method for command {0} with {1}").format(cmd, str(e)))
 
@@ -126,12 +127,22 @@ def web_logout():
 	)
 
 
-@frappe.whitelist(allow_guest=True, methods=["POST"])
+@frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep: guest-whitelisted-method
 def upload_file():
 	user = None
 	if frappe.session.user == "Guest":
 		if frappe.get_system_settings("allow_guests_to_upload_files"):
 			ignore_permissions = True
+			guest_allowed_docs = frappe.get_system_settings("allowed_doctypes_for_guest_uploads")
+			if guest_allowed_docs:
+				target_doctype = frappe.form_dict.doctype
+				allowed_docs = guest_allowed_docs.splitlines()
+				allowed_docs = [doc.strip() for doc in allowed_docs if doc.strip()]
+				if allowed_docs and target_doctype not in allowed_docs:
+					frappe.throw(
+						_("Guests are not allowed to upload files for {0} Doctype").format(target_doctype),
+						frappe.PermissionError,
+					)
 		else:
 			raise frappe.PermissionError
 	else:
@@ -139,7 +150,7 @@ def upload_file():
 		ignore_permissions = False
 
 	files = frappe.request.files
-	is_private = frappe.form_dict.is_private
+	is_private = frappe.form_dict.get("is_private", 1)
 	doctype = frappe.form_dict.doctype
 	docname = frappe.form_dict.docname
 	fieldname = frappe.form_dict.fieldname
@@ -190,6 +201,8 @@ def upload_file():
 		temp_path.unlink()
 		content_type = guess_type(filename)[0]
 		if optimize and content_type and content_type.startswith("image/"):
+			from frappe.utils.image import optimize_image
+
 			args = {"content": content, "content_type": content_type}
 			if frappe.form_dict.max_width:
 				args["max_width"] = int(frappe.form_dict.max_width)
@@ -209,9 +222,10 @@ def upload_file():
 	if method:
 		method = frappe.get_attr(method)
 		is_whitelisted(method)
+		is_valid_http_method(method)
 		return method()
 	else:
-		return frappe.get_doc(
+		doc = frappe.get_doc(
 			{
 				"doctype": "File",
 				"attached_to_doctype": doctype,
@@ -223,7 +237,11 @@ def upload_file():
 				"is_private": cint(is_private),
 				"content": content,
 			}
-		).save(ignore_permissions=ignore_permissions)
+		)
+		funcs = frappe.get_hooks("after_file_upload")
+		for func in funcs:
+			doc = frappe.call(func, doc=doc)
+		return doc.save(ignore_permissions=ignore_permissions)
 
 
 def check_write_permission(doctype: str | None = None, name: str | None = None):
@@ -324,6 +342,7 @@ def run_doc_method(method, docs=None, dt=None, dn=None, arg=None, args=None):
 	else:
 		response = doc.run_method(method, **args)
 
+	doc.apply_fieldlevel_read_permissions()
 	frappe.response.docs.append(doc)
 	if response is None:
 		return

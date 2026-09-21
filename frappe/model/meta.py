@@ -20,10 +20,9 @@ import os
 import typing
 from datetime import datetime
 
-import click
-
 import frappe
-from frappe import _, _lt
+from frappe import N_, _
+from frappe.app_state import is_disabled_app_filtering_active, is_module_disabled
 from frappe.model import (
 	NO_VALUE_FIELDS,
 	child_table_fields,
@@ -43,23 +42,23 @@ from frappe.model.workflow import get_workflow_name
 from frappe.modules import load_doctype_module
 from frappe.utils import cached_property, cast, cint, cstr
 from frappe.utils.caching import site_cache
-from frappe.utils.data import add_to_date, get_datetime
+from frappe.utils.data import add_to_date, get_currency_precision, get_datetime
 
 ListOrTuple = list | tuple
 SerializableTypes = str | int | float | datetime
 
 DEFAULT_FIELD_LABELS = {
-	"name": _lt("ID"),
-	"creation": _lt("Created On"),
-	"docstatus": _lt("Document Status"),
-	"idx": _lt("Index"),
-	"modified": _lt("Last Updated On"),
-	"modified_by": _lt("Last Updated By"),
-	"owner": _lt("Created By"),
-	"_user_tags": _lt("Tags"),
-	"_liked_by": _lt("Liked By"),
-	"_comments": _lt("Comments"),
-	"_assign": _lt("Assigned To"),
+	"name": N_("ID"),
+	"creation": N_("Created On"),
+	"docstatus": N_("Document Status"),
+	"idx": N_("Index"),
+	"modified": N_("Last Updated On"),
+	"modified_by": N_("Last Updated By"),
+	"owner": N_("Created By"),
+	"_user_tags": N_("Tags"),
+	"_liked_by": N_("Liked By"),
+	"_comments": N_("Comments"),
+	"_assign": N_("Assigned To"),
 }
 
 # When number of rows in a table exceeds this number, we disable certain features automatically.
@@ -196,20 +195,19 @@ class Meta(Document):
 	def get_dynamic_link_fields(self):
 		return self._dynamic_link_fields
 
-	def get_masked_fields(self):
+	def get_masked_fields(self, parenttype=None):
 		import copy
 
 		if frappe.session.user == "Administrator":
 			return []
-		cache_key = f"masked_fields::{self.name}::{frappe.session.user}"
+		cache_key = f"masked_fields::{self.name}::{parenttype or ''}::{frappe.session.user}"
 		masked_fields = frappe.cache.get_value(cache_key)
 
 		if masked_fields is None:
 			masked_fields = []
+			permlevel_access = set(self.get_permlevel_access("mask", parenttype))
 			for df in self.fields:
-				if df.get("mask") and not self.has_permlevel_access_to(
-					fieldname=df.fieldname, df=df, permission_type="mask"
-				):
+				if df.get("mask") and df.permlevel not in permlevel_access:
 					# work on a copy instead of original df
 					df_copy = copy.deepcopy(df)
 					df_copy.mask_readonly = 1
@@ -303,14 +301,18 @@ class Meta(Document):
 		return fieldname in self._fields
 
 	def get_label(self, fieldname):
-		"""Return label of the given fieldname."""
+		"""Return the untranslated source label of the given fieldname."""
 		if df := self.get_field(fieldname):
 			return df.get("label")
 
 		if fieldname in DEFAULT_FIELD_LABELS:
-			return str(DEFAULT_FIELD_LABELS[fieldname])
+			return DEFAULT_FIELD_LABELS[fieldname]
 
 		return "No Label"
+
+	def get_translated_label(self, fieldname):
+		"""Return the translated label of the given fieldname."""
+		return _(self.get_label(fieldname), context=self.name)
 
 	def get_options(self, fieldname):
 		return self.get_field(fieldname).options
@@ -330,6 +332,7 @@ class Meta(Document):
 		if "name" not in search_fields:
 			search_fields.append("name")
 
+		assert "name" in search_fields, "search fields must always include 'name'"
 		return search_fields
 
 	def get_fields_to_fetch(self, link_fieldname=None):
@@ -377,6 +380,7 @@ class Meta(Document):
 		if not title_field:
 			title_field = "name"
 
+		assert title_field, "title field must resolve to a non-empty fieldname"
 		return title_field
 
 	def get_translatable_fields(self):
@@ -417,6 +421,8 @@ class Meta(Document):
 		if not custom_fields:
 			return
 
+		custom_fields = [field for field in custom_fields if not is_field_hidden_by_app(field)]
+
 		self.extend("fields", custom_fields)
 
 	def apply_property_setters(self):
@@ -432,6 +438,13 @@ class Meta(Document):
 
 		if not property_setters:
 			return
+
+		hide_disabled = is_disabled_app_filtering_active()
+		property_setters = [
+			ps
+			for ps in property_setters
+			if not ((hide_disabled and ps.get("is_app_disabled")) or is_module_disabled(ps.module))
+		]
 
 		for ps in property_setters:
 			if ps.doctype_or_field == "DocType":
@@ -533,6 +546,10 @@ class Meta(Document):
 	def _non_computed_table_doctypes(self):
 		return {field.fieldname: field.options for field in self._non_computed_table_fields}
 
+	@cached_property
+	def ignore_versioning_fields(self) -> set[str]:
+		return {df.fieldname for df in self.fields if getattr(df, "ignore_versioning", False)}
+
 	def init_field_caches(self):
 		self._fields
 		self._table_fields
@@ -603,6 +620,13 @@ class Meta(Document):
 							# Break out to add this just after the last field
 							break
 						target_position = current_field
+				elif field.fieldtype == "Tab Break" and target_position in field_order:
+					# Find the next tab break and set target_position to just one field before,
+					# so the new tab is appended after the current tab instead of splitting it
+					for current_field in field_order[field_order.index(target_position) + 1 :]:
+						if self._fields[current_field].fieldtype == "Tab Break":
+							break
+						target_position = current_field
 				insertion_map.setdefault(target_position, []).append(field.fieldname)
 
 			else:
@@ -622,6 +646,7 @@ class Meta(Document):
 			field.idx = idx
 			sorted_fields.append(field)
 
+		assert len(sorted_fields) == len(field_order), "every field in field_order must map to a field"
 		self.fields = sorted_fields
 
 	def set_custom_permissions(self):
@@ -636,6 +661,10 @@ class Meta(Document):
 				filters=dict(parent=self.name),
 				update=dict(doctype="Custom DocPerm"),
 			)
+
+			if is_disabled_app_filtering_active():
+				custom_perms = [d for d in custom_perms if not d.get("is_app_disabled")]
+
 			if custom_perms:
 				self.permissions = [Document(d) for d in custom_perms]
 
@@ -719,12 +748,11 @@ class Meta(Document):
 		return permitted_fieldnames
 
 	def get_permlevel_access(self, permission_type="read", parenttype=None, *, user=None):
-		has_access_to = []
+		has_access_to = set()
 		roles = set(frappe.get_roles(user))
 		for perm in self.get_permissions(parenttype):
 			if perm.role in roles and perm.get(permission_type):
-				if perm.permlevel not in has_access_to:
-					has_access_to.append(perm.permlevel)
+				has_access_to.add(perm.permlevel)
 
 		return has_access_to
 
@@ -842,6 +870,27 @@ class Meta(Document):
 #######
 
 
+def is_field_hidden_by_app(df) -> bool:
+	"""Return True for a customization belonging to, or pointing at, a disabled app.
+
+	A Link or Table field whose target is concealed cannot work, so it is hidden
+	regardless of which app declared it.
+	"""
+	from frappe.app_state import get_disabled_doctypes
+
+	# The app that owns this field sets the flag in its `before_disable` hook.
+	if df.get("is_app_disabled") and is_disabled_app_filtering_active():
+		return True
+
+	if is_module_disabled(df.get("module")):
+		return True
+
+	return (
+		df.get("fieldtype") in ("Link", "Table", "Table MultiSelect")
+		and df.get("options") in get_disabled_doctypes()
+	)
+
+
 def get_parent_dt(dt):
 	if not frappe.is_table(dt):
 		return ""
@@ -918,12 +967,15 @@ def get_field_precision(df, doc=None, currency=None):
 		precision = cint(df.precision)
 
 	elif df.fieldtype == "Currency":
-		precision = cint(frappe.db.get_default("currency_precision"))
-		if not precision:
+		currency_precision = get_currency_precision()
+		if currency_precision is not None:
+			precision = currency_precision
+		else:
 			precision = get_precision_from_currency_format(currency or get_field_currency(df, doc))
 	else:
 		precision = cint(frappe.db.get_default("float_precision")) or 3
 
+	assert isinstance(precision, int), "computed field precision must be an integer"
 	return precision
 
 
@@ -959,6 +1011,8 @@ def trim_tables(doctype=None, dry_run=False, quiet=False):
 	as maintenance since removing a field in a DocType doesn't automatically
 	delete the db field.
 	"""
+	import click
+
 	UPDATED_TABLES = {}
 	filters = {"issingle": 0, "is_virtual": 0}
 	if doctype:
@@ -1031,7 +1085,7 @@ CACHE_PROPERTIES = frozenset(prop for prop, value in vars(Meta).items() if isins
 
 
 def _serialize(doc, no_nulls=False, *, is_child=False):
-	out = {}
+	out = frappe._dict()
 	for key, value in doc.__dict__.items():
 		if not is_child:
 			if key in CACHE_PROPERTIES:

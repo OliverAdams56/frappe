@@ -11,6 +11,8 @@ import frappe
 from frappe import _
 from frappe.integrations.utils import make_get_request
 from frappe.model.document import Document
+from frappe.utils.synchronization import filelock
+from frappe.www.login import sanitize_redirect
 
 if any((os.getenv("CI"), frappe.conf.developer_mode, frappe.conf.allow_tests)):
 	# Disable mandatory TLS in developer mode and tests
@@ -20,6 +22,8 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
 
 class ConnectedApp(Document):
+	_DOCTYPE_NAME = "Connected App"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -50,6 +54,7 @@ class ConnectedApp(Document):
 
 	@frappe.whitelist()
 	def get_openid_configuration(self):
+		self.check_permission("write")
 		if not self.openid_configuration:
 			frappe.throw(_("Please enter OpenID Configuration URL"))
 		return make_get_request(self.openid_configuration)
@@ -91,6 +96,10 @@ class ConnectedApp(Document):
 	def initiate_web_application_flow(self, user: str | None = None, success_uri: str | None = None):
 		"""Return an authorization URL for the user. Save state in Token Cache."""
 		user = user or frappe.session.user
+		if user != frappe.session.user:
+			self.check_permission("write")
+		success_uri = sanitize_redirect(success_uri) if getattr(frappe.local, "request", None) else None
+
 		oauth = self.get_oauth2_session(user, init=True)
 		query_params = self.get_query_params()
 		authorization_url, state = oauth.authorization_url(self.authorization_uri, **query_params)
@@ -140,18 +149,22 @@ class ConnectedApp(Document):
 		user = user or frappe.session.user
 		token_cache = self.get_token_cache(user)
 		if token_cache and token_cache.is_expired():
-			oauth_session = self.get_oauth2_session(user)
-
 			try:
-				token = oauth_session.refresh_token(
-					body=f"redirect_uri={self.redirect_uri}",
-					token_url=self.token_uri,
-				)
+				with filelock(f"token_cache_{token_cache.name}"):
+					# Another worker may have refreshed while we waited for the lock.
+					token_cache.reload()
+					if not token_cache.is_expired():
+						return token_cache
+
+					oauth_session = self.get_oauth2_session(user)
+					token = oauth_session.refresh_token(
+						body=f"redirect_uri={self.redirect_uri}",
+						token_url=self.token_uri,
+					)
+					token_cache.update_data(token)
 			except Exception:
 				self.log_error("Token Refresh Error")
 				return None
-
-			token_cache.update_data(token)
 
 		return token_cache
 
@@ -183,7 +196,9 @@ class ConnectedApp(Document):
 		return token_cache
 
 
-@frappe.whitelist(methods=["GET"], allow_guest=True)
+# OAuth providers must be able to return here before authentication; guests are redirected
+# to login below, and authenticated callbacks must match the stored OAuth state.
+@frappe.whitelist(methods=["GET"], allow_guest=True)  # nosemgrep: guest-whitelisted-method
 def callback(code: str | None = None, state: str | None = None):
 	"""Handle client's code.
 
@@ -209,10 +224,15 @@ def callback(code: str | None = None, state: str | None = None):
 
 	oauth_session = connected_app.get_oauth2_session(init=True)
 	query_params = connected_app.get_query_params()
+	client_secret = connected_app.get_password("client_secret")
+	if frappe.db.db_type == "sqlite":
+		# The token endpoint can write through another connection. End this read-only
+		# snapshot first so saving the returned token starts from the latest database state.
+		frappe.db.rollback()
 	token = oauth_session.fetch_token(
 		connected_app.token_uri,
 		code=code,
-		client_secret=connected_app.get_password("client_secret"),
+		client_secret=client_secret,
 		include_client_id=True,
 		**query_params,
 	)

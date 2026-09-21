@@ -13,11 +13,38 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from bs4 import BeautifulSoup
-
 import frappe
+from frappe.database.sqlite import DEFAULT_BUSY_TIMEOUT_SECONDS
 from frappe.model.document import Document
 from frappe.utils import update_progress_bar
+from frappe.utils.file_lock import LockTimeoutError
+from frappe.utils.synchronization import filelock
+
+SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def strip_surrogates(value):
+	"""Repair or drop Unicode surrogate code points so a value can be encoded as UTF-8.
+
+	Inbound data (for example e-mail bodies that were mis-decoded from UTF-16) can
+	carry paired or lone surrogate code points inside Python ``str`` objects.
+	SQLite encodes bound parameters as strict UTF-8, which raises
+	``UnicodeEncodeError: ... surrogates not allowed`` for any surrogate code
+	point and aborts the whole ``cursor.executemany()`` call during indexing.
+
+	A round-trip through UTF-16 (with ``surrogatepass``) re-pairs valid surrogate
+	pairs into their real astral character (so a mis-encoded emoji survives), and
+	the following UTF-8 ``ignore`` pass drops any remaining lone surrogate.
+	Non-``str`` and surrogate-free values are returned unchanged.
+	"""
+	if not isinstance(value, str) or not SURROGATE_RE.search(value):
+		return value
+	return (
+		value.encode("utf-16-le", "surrogatepass")
+		.decode("utf-16-le", "surrogatepass")
+		.encode("utf-8", "ignore")
+		.decode("utf-8")
+	)
 
 
 class WarningType(Enum):
@@ -404,12 +431,15 @@ class SQLiteSearch(ABC):
 					if documents:
 						self._index_documents(documents)
 
-						# Update progress with last processed document cursor
-						last_doc_modified = docs[-1].get(progress_field) or docs[-1].get("modified")
-						last_doc_name = docs[-1]["name"]
-						self._update_index_progress(doctype, last_doc_name, last_doc_modified, len(documents))
-						last_indexed_modified = last_doc_modified
-						last_indexed_name = last_doc_name
+					# Advance the cursor even when nothing in this batch was indexable: these
+					# rows have been consumed either way. Advancing only when `documents` was
+					# non-empty meant a batch whose documents all failed prepare_document()
+					# was fetched again forever, so build_index() never returned.
+					last_doc_modified = docs[-1].get(progress_field) or docs[-1].get("modified")
+					last_doc_name = docs[-1]["name"]
+					self._update_index_progress(doctype, last_doc_name, last_doc_modified, len(documents))
+					last_indexed_modified = last_doc_modified
+					last_indexed_name = last_doc_name
 
 					batch_count += 1
 
@@ -705,14 +735,14 @@ class SQLiteSearch(ABC):
 					doctype, filters=config.get("filters", {}), fields=[{"COUNT": "name", "as": "count"}]
 				).run(as_dict=True)[0]["count"]
 
-				cursor.execute(
-					"""
-					INSERT INTO search_index_progress
-					(doctype, total_docs, indexed_docs, batch_size, is_complete, started_at, updated_at, vocabulary_built, last_indexed_modified)
-					VALUES (?, ?, 0, 1000, 0, datetime('now'), datetime('now'), 0, 0)
-				""",
-					(doctype, total_count),
-				)
+			cursor.execute(
+				"""
+				INSERT INTO search_index_progress
+				(doctype, total_docs, indexed_docs, batch_size, is_complete, started_at, updated_at, vocabulary_built, last_indexed_modified)
+				VALUES (?, ?, 0, 1000, 0, datetime('now'), datetime('now'), 0, ?)
+			""",
+				(doctype, total_count, "1970-01-01 00:00:00"),
+			)
 
 		self._with_connection(init_progress)
 
@@ -1202,7 +1232,7 @@ class SQLiteSearch(ABC):
 
 	def _set_pragmas(self, cursor, is_read=False):
 		"""Set SQLite performance pragmas."""
-		cursor.execute("PRAGMA busy_timeout = 5000;")  # Wait up to 5 seconds if the database is locked
+		cursor.execute(f"PRAGMA busy_timeout = {DEFAULT_BUSY_TIMEOUT_SECONDS * 1000};")
 		cursor.execute("PRAGMA journal_mode = WAL;")  # Write-Ahead Logging for concurrency
 		cursor.execute("PRAGMA synchronous = NORMAL;")  # Better performance vs FULL
 		cursor.execute("PRAGMA cache_size = -8192;")  # 8MB cache
@@ -1356,7 +1386,7 @@ class SQLiteSearch(ABC):
 							doc_id = doc.get("id") or f"{doc.get('doctype', '')}:{doc.get('name', '')}"
 							values.append(doc_id)
 						else:
-							values.append(doc.get(field, ""))
+							values.append(strip_surrogates(doc.get(field, "")))
 
 					doc_ids_to_delete.append(doc_id)
 
@@ -1585,6 +1615,8 @@ class SQLiteSearch(ABC):
 		if not content:
 			return ""
 
+		from bs4 import BeautifulSoup
+
 		# Convert to string in case it's a Mock object or other type
 		content = str(content)
 
@@ -1601,6 +1633,7 @@ class SQLiteSearch(ABC):
 		text = soup.get_text(separator=" ").strip()  # remove tags
 		text = re.sub(r"https?://[^\s]+", "[link]", text)  # replace standalone links
 		text = re.sub(r"\s+", " ", text).strip()  # normalize whitespace
+		text = strip_surrogates(text)  # drop/repair UTF-16 surrogate code points
 		return text
 
 	def _generate_trigrams(self, word):
@@ -1782,13 +1815,22 @@ def build_index(
 	if search.index_exists() and not force:
 		return
 
-	# For continuation jobs, always proceed regardless of existing index
-	if is_continuation or force:
-		if is_continuation:
-			print(f"{SearchClass.__name__}: Continuing incremental index build...")
-		else:
-			print(f"{SearchClass.__name__}: Index does not exist or force=True, building...")
-		search.build_index(is_continuation=is_continuation)
+	if is_continuation:
+		print(f"{SearchClass.__name__}: Continuing incremental index build...")
+	else:
+		print(f"{SearchClass.__name__}: Index does not exist or force=True, building...")
+
+	try:
+		with filelock(_build_lock_name(SearchClass), timeout=0):
+			search.build_index(is_continuation=is_continuation)
+	except LockTimeoutError:
+		print(f"{SearchClass.__name__}: another build is already running, skipping.")
+
+
+def _build_lock_name(SearchClass: type[SQLiteSearch]) -> str:
+	"""One lock per search class. A fresh build deletes any temporary database it finds, so two
+	of them on one class would delete each other's work."""
+	return f"search_index_{SearchClass.__module__}.{SearchClass.__name__}"
 
 
 def _enqueue_index_job(search_class_path: str, is_continuation: bool = False):

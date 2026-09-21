@@ -33,6 +33,45 @@ def slug(name):
 	return name.lower().replace(" ", "-")
 
 
+def is_item_allowed(name, item_type, ctx):
+	"""Return whether the user may see a sidebar/workspace item.
+
+	`ctx` is any object exposing the per-user view-permission caches (`can_read`,
+	`allowed_pages`, `allowed_reports`, `allowed_dashboards`, `allowed_workspaces`,
+	`restricted_doctypes`, `restricted_pages`) — in practice a
+	`frappe.desk.desk_views.DeskViews` instance.
+	"""
+	if frappe.session.user == "Administrator":
+		return True
+
+	item_type = item_type.lower()
+
+	if item_type == "doctype":
+		try:
+			return (
+				name in (ctx.can_read or [])
+				and name in (ctx.restricted_doctypes or [])
+				and frappe.has_permission(name)
+			)
+		except frappe.DoesNotExistError:
+			frappe.clear_last_message()
+			return False
+	if item_type == "page":
+		# `restricted_pages` is None while a patch, install or migrate is running, the same as
+		# `restricted_doctypes` above, so it is coalesced rather than iterated blindly.
+		return name in (ctx.allowed_pages or {}) and name in (ctx.restricted_pages or [])
+	if item_type == "report":
+		return not frappe.db.get_value("Report", name, "disabled", cache=True) and name in ctx.allowed_reports
+	if item_type == "dashboard":
+		return name in (ctx.allowed_dashboards or [])
+	if item_type in ("help", "url"):
+		return True
+	if item_type == "workspace":
+		return name in (ctx.allowed_workspaces or [])
+
+	return False
+
+
 def pop_csv_params(form_dict):
 	"""Pop csv params from form_dict and return them as a dict."""
 	from csv import QUOTE_NONNUMERIC
@@ -51,11 +90,13 @@ def get_csv_bytes(data: list[list], csv_params: dict) -> bytes:
 	from csv import writer
 	from io import StringIO
 
+	from frappe.utils.csvutils import escape_formula_injection
+
 	decimal_sep = csv_params.pop("decimal_sep", None)
 
-	_data = data.copy()
+	_data = [[escape_formula_injection(v) for v in row] for row in data]
 	if decimal_sep:
-		_data = apply_csv_decimal_sep(data, decimal_sep)
+		_data = apply_csv_decimal_sep(_data, decimal_sep)
 
 	file = StringIO()
 	csv_writer = writer(file, **csv_params)

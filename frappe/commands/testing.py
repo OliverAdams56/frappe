@@ -13,6 +13,19 @@ from frappe.utils.bench_helper import CliCtxObj
 
 if TYPE_CHECKING:
 	from frappe.testing import TestRunner
+	from frappe.tests.utils.test_capabilities import TestService
+
+
+def _parse_test_service(_context, _parameter, value: str | None) -> "TestService | None":
+	if value is None:
+		return None
+
+	from frappe.tests.utils.test_capabilities import TestService
+
+	try:
+		return TestService.from_cli_name(value)
+	except ValueError as error:
+		raise click.BadParameter(str(error)) from error
 
 
 def main(
@@ -34,6 +47,7 @@ def main(
 	debug_exceptions: tuple[Exception] | None = None,
 	selected_categories: list[str] | None = None,
 	lightmode: bool = False,
+	test_service: "TestService | None" = None,
 ) -> None:
 	"""Main function to run tests"""
 	if lightmode:
@@ -53,6 +67,7 @@ def main(
 			doctype_list_path=doctype_list_path,
 			failfast=failfast,
 			case=case,
+			test_service=test_service,
 		)
 		run_tests_in_light_mode(test_params)
 		return
@@ -107,6 +122,7 @@ def main(
 		"debug_exceptions",
 		"debug",
 		"selected_categories",
+		"test_service",
 	]:
 		param_value = locals()[param_name]
 		if param_value is not None:
@@ -132,6 +148,7 @@ def main(
 		pdb_on_exceptions=debug_exceptions,
 		selected_categories=selected_categories or [],
 		skip_before_tests=skip_before_tests,
+		test_service=test_service,
 	)
 
 	_initialize_test_environment(site, test_config)
@@ -183,6 +200,10 @@ def main(
 
 
 def run_tests_in_light_mode(test_params):
+	import cProfile
+	import pstats
+	from io import StringIO
+
 	from frappe.testing.loader import FrappeTestLoader
 	from frappe.testing.result import FrappeTestResult
 	from frappe.tests.utils import toggle_test_mode
@@ -201,7 +222,20 @@ def run_tests_in_light_mode(test_params):
 
 	toggle_test_mode(True)
 	suite = FrappeTestLoader().discover_tests(test_params)
+
+	if test_params.profile:
+		pr = cProfile.Profile()
+		pr.enable()
+
 	result = unittest.TextTestRunner(failfast=test_params.failfast, resultclass=FrappeTestResult).run(suite)
+
+	if test_params.profile:
+		pr.disable()
+		s = StringIO()
+		ps = pstats.Stats(pr, stream=s).sort_stats("cumulative")
+		ps.print_stats()
+		print(s.getvalue())
+
 	if not result.wasSuccessful():
 		sys.exit(1)
 
@@ -285,7 +319,11 @@ def _get_doctypes_for_module_def(app, module_def):
 @click.option("--coverage", is_flag=True, default=False)
 @click.option("--skip-test-records", is_flag=True, default=False, help="DEPRECATED")
 @click.option("--skip-before-tests", is_flag=True, default=False, help="Don't run before tests hook")
-@click.option("--junit-xml-output", help="Destination file path for junit xml report")
+@click.option(
+	"--junit-xml-output",
+	type=click.Path(dir_okay=False, file_okay=True, resolve_path=True),
+	help="Destination file path for junit xml report",
+)
 @click.option(
 	"--failfast", is_flag=True, default=False, help="Stop the test run on the first error or failure"
 )
@@ -294,6 +332,12 @@ def _get_doctypes_for_module_def(app, module_def):
 	type=click.Choice(["unit", "integration", "all"]),
 	default="all",
 	help="Select test category to run",
+)
+@click.option(
+	"--test-service",
+	callback=_parse_test_service,
+	metavar="SERVICE",
+	help="Run only tests that declare a required service (for example, web-server).",
 )
 @click.option("--lightmode", is_flag=True, default=False)
 @pass_context
@@ -314,6 +358,7 @@ def run_tests(
 	case=None,
 	test_category="all",
 	lightmode=False,
+	test_service=None,
 	debug=False,
 ):
 	"""Run python unit-tests"""
@@ -359,6 +404,7 @@ def run_tests(
 			debug=debug,
 			selected_categories=[] if test_category == "all" else test_category,
 			lightmode=lightmode,
+			test_service=test_service,
 		)
 
 
@@ -442,7 +488,11 @@ def run_parallel_tests(
 @click.option("--parallel", is_flag=True, help="Run UI Test in parallel mode")
 @click.option("--with-coverage", is_flag=True, help="Generate coverage report")
 @click.option("--browser", default="chrome", help="Browser to run tests in")
-@click.option("--spec", help="Spec file to run")
+@click.option(
+	"--spec",
+	type=click.Path(dir_okay=False, file_okay=True),
+	help="Spec file to run",
+)
 @click.option("--ci-build-id")
 @pass_context
 def run_ui_tests(

@@ -37,7 +37,7 @@ from frappe.utils import (
 	strip_html,
 )
 from frappe.utils.defaults import get_not_null_defaults
-from frappe.utils.html_utils import unescape_html
+from frappe.utils.html_utils import has_html_tags, unescape_html
 
 if TYPE_CHECKING:
 	from frappe.model.document import Document
@@ -415,6 +415,8 @@ class BaseDocument:
 			self.__dict__[key] = table = []
 
 		d = self._init_child(value, key)
+		assert isinstance(table, list), "child table storage must be a list"
+		assert d.parentfield == key, "appended child's parentfield must match the table key"
 
 		if position == -1:
 			table.append(d)
@@ -498,6 +500,8 @@ class BaseDocument:
 			__dict["__islocal"] = 1
 			__dict["__temporary_name"] = frappe.generate_hash(length=10)
 
+		assert isinstance(child, BaseDocument), "initialized child must be a BaseDocument"
+		assert __dict["parenttype"] == self.doctype, "child parenttype must reference its parent's doctype"
 		return child
 
 	@cached_property
@@ -556,9 +560,17 @@ class BaseDocument:
 		d = _dict()
 		field_values = self.__dict__
 		field_map = self.meta._fields
+		masked_fieldnames = self.flags.get("masked_fieldnames")
 
 		for fieldname in self.meta.get_valid_fields():
 			value = field_values.get(fieldname)
+
+			# Masked fields hold the XXXXXXXX placeholder; pass it through untouched so it is not
+			# cast back to 0 for numeric fieldtypes. Only truthy values get masked, so falsy ones
+			# fall through to the normal null-aware path.
+			if value and fieldname in (masked_fieldnames or ()):
+				d[fieldname] = value
+				continue
 
 			# if no need for sanitization and value is None, continue
 			if not sanitize and value is None:
@@ -575,7 +587,7 @@ class BaseDocument:
 					value = self.get_virtual_field_value(df)
 
 				fieldtype = df.fieldtype
-				if isinstance(value, list) and fieldtype not in table_fields:
+				if isinstance(value, list) and fieldtype not in table_fields and fieldtype != "JSON":
 					frappe.throw(_("Value for {0} cannot be a list").format(_(df.label, context=df.parent)))
 
 				if fieldtype == "Check":
@@ -584,11 +596,14 @@ class BaseDocument:
 				elif fieldtype == "Int" and not isinstance(value, int):
 					value = cint(value)
 
-				elif fieldtype == "JSON" and isinstance(value, dict):
+				elif fieldtype == "JSON" and isinstance(value, (dict, list)):
 					value = json.dumps(value, separators=(",", ":"))
 
 				elif fieldtype in float_like_fields and not isinstance(value, float):
 					value = flt(value)
+
+				elif fieldtype == "Read Only" and not isinstance(value, str):
+					value = cstr(value)
 
 				elif (fieldtype in datetime_fields and value == "") or (
 					getattr(df, "unique", False) and cstr(value).strip() == ""
@@ -656,7 +671,7 @@ class BaseDocument:
 		return valid_columns_cache[self.doctype]
 
 	def is_new(self) -> bool:
-		return self.get("__islocal")
+		return bool(self.get("__islocal"))
 
 	@property
 	def docstatus(self) -> DocStatus:
@@ -757,12 +772,14 @@ class BaseDocument:
 
 		args:
 		        ignore_if_duplicate: ignore primary key collision
-		                                        at database level (postgres)
+		                                        at database level (postgres, sqlite)
 		                                        in python (mariadb)
 		"""
 		if not self.name:
 			# name will be set by document class in most cases
 			set_new_name(self)
+
+		assert self.name, "document name must be set before db_insert"
 
 		conflict_handler = ""
 		returning = ""
@@ -773,9 +790,17 @@ class BaseDocument:
 			and frappe.db.db_type == "postgres"
 			and (self.flags.retry_count or 0) < 5
 		):
-			conflict_handler = "on conflict (name) do nothing"
 			if self.meta.autoname == "hash":
+				# A hash name that collides has to be regenerated, so only `name` may be skipped.
+				conflict_handler = "on conflict (name) do nothing"
 				returning = "RETURNING name"
+			else:
+				# Any unique index, not only the primary key: a doctype named after a unique field
+				# breaks both with one row. Letting postgres skip the row keeps the transaction
+				# usable, which catching the error below would not.
+				conflict_handler = "on conflict do nothing"
+		elif ignore_if_duplicate and frappe.db.db_type == "sqlite":
+			conflict_handler = "on conflict (name) do nothing"
 
 		if not self.creation:
 			self.creation = self.modified = now()
@@ -820,8 +845,21 @@ class BaseDocument:
 					raise frappe.DuplicateEntryError(self.doctype, self.name, e)
 
 			elif frappe.db.is_unique_key_violation(e):
-				# unique constraint
-				self.show_unique_validation_message(e)
+				# A doctype named after a unique field breaks two indexes with one row, and which
+				# one the backend blames is its own choice: MariaDB says PRIMARY and is handled
+				# above, SQLite says the secondary index and arrives here. `ignore_if_duplicate`
+				# has to mean the same thing in both places.
+				if not ignore_if_duplicate:
+					if frappe.db.db_type == "sqlite" and frappe.db.exists(self.doctype, self.name):
+						frappe.msgprint(
+							_("{0} {1} already exists").format(_(self.doctype), frappe.bold(self.name)),
+							title=_("Duplicate Name"),
+							indicator="red",
+						)
+						raise frappe.DuplicateEntryError(self.doctype, self.name, e)
+
+					# unique constraint
+					self.show_unique_validation_message(e)
 
 			else:
 				raise
@@ -1043,7 +1081,9 @@ class BaseDocument:
 				assert df.fieldtype == "Dynamic Link"
 				doctype = self.get(df.options)
 				if not doctype:
-					frappe.throw(_("{0} must be set first").format(_(self.meta.get_label(df.options))))
+					frappe.throw(
+						_("{0} must be set first").format(self.meta.get_translated_label(df.options))
+					)
 				invalidate_distinct_link_doctypes(df.parent, df.options, doctype)
 
 			meta = frappe.get_meta(doctype)
@@ -1172,7 +1212,7 @@ class BaseDocument:
 			if value not in options and not (frappe.in_test and value.startswith("_T-")):
 				# show an elaborate message
 				prefix = _("Row #{0}:").format(self.idx) if self.get("parentfield") else ""
-				label = _(self.meta.get_label(df.fieldname))
+				label = self.meta.get_translated_label(df.fieldname)
 				comma_options = '", "'.join(_(each) for each in options)
 
 				frappe.throw(
@@ -1247,7 +1287,7 @@ class BaseDocument:
 
 			if self.get(fieldname) != value:
 				frappe.throw(
-					_("Value cannot be changed for {0}").format(_(self.meta.get_label(fieldname))),
+					_("Value cannot be changed for {0}").format(self.meta.get_translated_label(fieldname)),
 					frappe.CannotChangeConstantError,
 				)
 
@@ -1362,8 +1402,6 @@ class BaseDocument:
 
 		- Ignore if 'Ignore XSS Filter' is checked or fieldtype is 'Code'
 		"""
-		from bs4 import BeautifulSoup
-
 		if frappe.flags.in_install:
 			return
 
@@ -1377,7 +1415,7 @@ class BaseDocument:
 				# doesn't look like html so no need
 				continue
 
-			elif "<!-- markdown -->" in value and not bool(BeautifulSoup(value, "html.parser").find()):
+			elif "<!-- markdown -->" in value and not has_html_tags(value):
 				# should be handled separately via the markdown converter function
 				continue
 
@@ -1387,7 +1425,7 @@ class BaseDocument:
 			if df and (
 				df.get("ignore_xss_filter")
 				or (df.get("fieldtype") in ("Data", "Small Text", "Text") and df.get("options") == "Email")
-				or df.get("fieldtype") in ("Attach", "Attach Image", "Barcode", "Code")
+				or df.get("fieldtype") in ("Attach", "Attach Image", "Barcode", "Code", "JSON")
 				# cancelled and submit but not update after submit should be ignored
 				or self.docstatus.is_cancelled()
 				or (self.docstatus.is_submitted() and not df.get("allow_on_submit"))
@@ -1492,7 +1530,9 @@ class BaseDocument:
 		if not doc:
 			doc = getattr(self, "parent_doc", None) or self
 
-		if (absolute_value or doc.get("absolute_value")) and isinstance(val, int | float):
+		if (
+			absolute_value or (getattr(doc, "flags", None) and doc.flags.get("absolute_value"))
+		) and isinstance(val, int | float):
 			val = abs(self.get(fieldname))
 
 		return format_value(val, df=df, doc=doc, currency=currency, format=format)
@@ -1527,15 +1567,12 @@ class BaseDocument:
 		return print_hide
 
 	def in_format_data(self, fieldname):
-		"""Return True if shown via Print Format::`format_data` property.
+		"""Compatibility shim for third-party server-side print templates.
 
-		Called from within standard print format."""
-		doc = getattr(self, "parent_doc", self)
-
-		if hasattr(doc, "format_data_map"):
-			return fieldname in doc.format_data_map
-		else:
-			return True
+		The classic print format builder that populated `format_data_map` has been
+		removed; builder layouts now render through PrintFormatGenerator, so every
+		field is considered in scope here."""
+		return True
 
 	def reset_values_if_no_permlevel_access(self, has_access_to, high_permlevel_fields, mask_fields=None):
 		"""If the user does not have permissions at permlevel > 0, then reset the values to original / default"""
@@ -1640,7 +1677,9 @@ def _filter(data, filters, limit=None):
 	return out
 
 
-CACHED_PROPERTIES = (prop for prop, value in vars(BaseDocument).items() if isinstance(value, cached_property))
+CACHED_PROPERTIES = tuple(
+	prop for prop, value in vars(BaseDocument).items() if isinstance(value, cached_property)
+)
 
 UNPICKLABLE_KEYS = frozenset(
 	(

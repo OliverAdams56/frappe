@@ -9,6 +9,8 @@ from frappe.utils import cint
 
 
 class Workflow(Document):
+	_DOCTYPE_NAME = "Workflow"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -22,6 +24,7 @@ class Workflow(Document):
 		from frappe.workflow.doctype.workflow_transition.workflow_transition import WorkflowTransition
 
 		document_type: DF.Link
+		enable_action_confirmation: DF.Check
 		is_active: DF.Check
 		override_status: DF.Check
 		send_email_alert: DF.Check
@@ -39,6 +42,9 @@ class Workflow(Document):
 	def on_update(self):
 		self.create_custom_field_for_workflow_state()
 		self.update_default_workflow_status()
+
+	def on_trash(self):
+		frappe.clear_cache(doctype=self.document_type)
 
 	def create_custom_field_for_workflow_state(self):
 		frappe.clear_cache(doctype=self.document_type)
@@ -68,17 +74,18 @@ class Workflow(Document):
 	def update_default_workflow_status(self):
 		docstatus_map = {}
 		states = self.get("states")
+
+		TargetDocType = frappe.qb.DocType(self.document_type)
+		state_field = getattr(TargetDocType, self.workflow_state_field)
+
 		for d in states:
 			if d.doc_status not in docstatus_map:
-				frappe.db.sql(
-					f"""
-					UPDATE `tab{self.document_type}`
-					SET `{self.workflow_state_field}` = %s
-					WHERE ifnull(`{self.workflow_state_field}`, '') = ''
-					AND `docstatus` = %s
-				""",
-					(d.state, d.doc_status),
-				)
+				(
+					frappe.qb.update(TargetDocType)
+					.set(state_field, d.state)
+					.where(state_field.isnull() | (state_field == ""))
+					.where(TargetDocType.docstatus == d.doc_status)
+				).run()
 
 				docstatus_map[d.doc_status] = d.state
 
@@ -126,12 +133,12 @@ class Workflow(Document):
 
 	def set_active(self):
 		if cint(self.is_active):
-			# clear all other
-			frappe.db.sql(
-				"""UPDATE `tabWorkflow` SET `is_active`=0
-				WHERE `document_type`=%s""",
-				self.document_type,
-			)
+			Workflow = frappe.qb.DocType("Workflow")
+			(
+				frappe.qb.update(Workflow)
+				.set(Workflow.is_active, 0)
+				.where(Workflow.document_type == self.document_type)
+			).run()
 
 
 @frappe.whitelist()

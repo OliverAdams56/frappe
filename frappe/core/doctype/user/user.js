@@ -4,7 +4,6 @@ frappe.ui.form.on("User", {
 			return {
 				filters: {
 					for_user: ["in", ["", frappe.session.user]],
-					title: ["!=", "Welcome Workspace"],
 				},
 			};
 		});
@@ -103,6 +102,11 @@ frappe.ui.form.on("User", {
 	refresh: function (frm) {
 		let doc = frm.doc;
 
+		frappe.scroll_to_user_roles_field = function () {
+			frappe.hide_msgprint(true);
+			frm.scroll_to_field("roles_html");
+		};
+
 		frappe.xcall("frappe.apps.get_apps").then((r) => {
 			let apps = r?.map((r) => r.name) || [];
 			frm.set_df_property("default_app", "options", ["", ...apps]);
@@ -160,6 +164,17 @@ frappe.ui.form.on("User", {
 				);
 
 				frm.toggle_display(["sb1", "sb3", "modules_access"], true);
+			}
+
+			if (cint(frm.doc.enabled) && frm.has_perm("write")) {
+				frm.add_custom_button(
+					__("Change Password"),
+					() =>
+						frappe.ui.show_change_password_dialog(frm.doc.name, () =>
+							frm.reload_doc()
+						),
+					__("Password")
+				);
 			}
 
 			frm.add_custom_button(
@@ -227,7 +242,7 @@ frappe.ui.form.on("User", {
 			}
 
 			if (
-				cint(frappe.boot.sysdefaults.enable_two_factor_auth) &&
+				frappe.defaults.is_enabled("enable_two_factor_auth") &&
 				(frappe.session.user == doc.name || frappe.user.has_role("System Manager"))
 			) {
 				frm.add_custom_button(
@@ -378,8 +393,8 @@ frappe.ui.form.on("User", {
 	},
 	setup_impersonation: function (frm) {
 		if (
-			frappe.session.user === "Administrator" &&
-			frm.doc.name != "Administrator" &&
+			(frappe.session.user === "Administrator" || frm.has_perm("impersonate")) &&
+			frm.doc.name !== frappe.session.user &&
 			!frm.is_new()
 		) {
 			frm.add_custom_button(__("Impersonate"), () => {

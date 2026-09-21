@@ -3,7 +3,8 @@
 
 import json
 import os
-import textwrap
+import threading
+from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.core.doctype.user_permission.test_user_permission import create_user
@@ -21,6 +22,65 @@ class TestReport(IntegrationTestCase):
 	def setUpClass(cls) -> None:
 		cls.enterClassContext(cls.enable_safe_exec())
 		return super().setUpClass()
+
+	def test_aggregate_column_field_info(self):
+		"""Aggregate column gets proper label and fieldtype"""
+		from frappe.core.doctype.report.report import get_group_by_column_field
+
+		cases = [
+			({"aggregate_function": "count"}, "Count", "Int"),
+			(
+				{"aggregate_function": "sum", "aggregate_on": "`tabUser`.`simultaneous_sessions`"},
+				"Sum of Simultaneous Sessions",
+				"Int",
+			),
+			(
+				{"aggregate_function": "avg", "aggregate_on": "`tabUser`.`simultaneous_sessions`"},
+				"Average of Simultaneous Sessions",
+				"Float",
+			),
+		]
+
+		for args, expected_label, expected_fieldtype in cases:
+			with self.subTest(aggregate_function=args["aggregate_function"]):
+				info = get_group_by_column_field(args, "User")
+				self.assertEqual(info["label"], expected_label)
+				self.assertEqual(info["fieldtype"], expected_fieldtype)
+
+	def test_parse_aggregate_field(self):
+		"""parse_aggregate_field extracts function name and target from aggregate field"""
+		from frappe.desk.reportview import parse_aggregate_field
+
+		cases = [
+			# dict form (produced by setup_group_by for qb)
+			(
+				{"COUNT": "`tabSales Invoice`.`name`", "as": "_aggregate_column"},
+				("COUNT", "`tabSales Invoice`.`name`"),
+			),
+			(
+				{"SUM": "`tabSales Invoice`.`amount`", "as": "_aggregate_column"},
+				("SUM", "`tabSales Invoice`.`amount`"),
+			),
+			# lowercase function in dict is normalized to uppercase
+			(
+				{"avg": "`tabSales Invoice`.`amount`"},
+				("AVG", "`tabSales Invoice`.`amount`"),
+			),
+			# string form with " as " alias
+			(
+				"count(`tabSales Invoice`.`amount`) as _aggregate_column",
+				("COUNT", "`tabSales Invoice`.`amount`"),
+			),
+			# string form without alias
+			(
+				"sum(`tabSales Invoice`.`amount`)",
+				("SUM", "`tabSales Invoice`.`amount`"),
+			),
+		]
+
+		for field, expected in cases:
+			with self.subTest(field=field):
+				self.assertEqual(parse_aggregate_field(field), expected)
 
 	def test_report_builder(self):
 		if frappe.db.exists("Report", "User Activity Report"):
@@ -333,6 +393,28 @@ result = [
 		# check values
 		self.assertTrue("System User" in [d.get("type") for d in data[1]])
 
+	def test_prepared_report_automation_targets_the_report_that_ran(self):
+		"""A custom report auto-enables prepared report on itself, not on its reference report."""
+		reference_report = "Permitted Documents For User"
+		filters = {"user": "Administrator", "doctype": "User"}
+		custom_report = save_report(
+			reference_report, "Permitted Documents For User Prepared", "[]", json.dumps(filters)
+		)
+		frappe.cache.hdel("report_execution_time", [reference_report, custom_report])
+
+		def prepared_report_watcher_targets():
+			timer = MagicMock()
+			with patch.object(threading, "Timer", timer):
+				run(report_name=custom_report, filters=filters, are_default_filters=False)
+			return [call.kwargs["kwargs"]["report"] for call in timer.call_args_list]
+
+		self.assertEqual(prepared_report_watcher_targets(), [custom_report])
+		self.assertIsNotNone(frappe.cache.hget("report_execution_time", custom_report))
+		self.assertIsNone(frappe.cache.hget("report_execution_time", reference_report))
+
+		frappe.db.set_value("Report", custom_report, "disable_prepared_report_automation", 1)
+		self.assertEqual(prepared_report_watcher_targets(), [])
+
 	def test_toggle_disabled(self):
 		"""Make sure that authorization is respected."""
 		# Assuming that there will be reports in the system.
@@ -424,14 +506,168 @@ result = [
 			)
 
 			cached_bootinfo = frappe.sessions.get()
-			self.assertIn(report_name, cached_bootinfo["user"]["all_reports"])
+			self.assertIn(report_name, cached_bootinfo["allowed_reports"])
 
 			doc = frappe.get_doc("Report", report_name)
 			delete_report(doc.name)
 
 			cached_bootinfo = frappe.sessions.get()
-			self.assertNotIn(report_name, cached_bootinfo["user"]["all_reports"])
+			self.assertNotIn(report_name, cached_bootinfo["allowed_reports"])
 
 		finally:
 			frappe.local.request = None
 			frappe.set_user("Administrator")
+
+	def test_save_report_group_by_validation(self):
+		"""save_report rejects invalid group_by settings and accepts valid ones"""
+
+		def _settings(group_by):
+			return json.dumps(
+				{
+					"filters": [],
+					"fields": [["user_type", "User"], ["_aggregate_column", "User"]],
+					"order_by": "_aggregate_column desc",
+					"group_by": group_by,
+				}
+			)
+
+		# invalid
+
+		with self.assertRaises(frappe.DataError):
+			_save_report(
+				"Test Invalid 1",
+				"User",
+				_settings(
+					{
+						"group_by": "`tabUser`.`user_type`",
+						"aggregate_function": "avg",
+						"aggregate_on": "length(name)",
+					}
+				),
+			)
+
+		with self.assertRaises(frappe.DataError):
+			_save_report(
+				"Test Invalid 2",
+				"User",
+				_settings(
+					{
+						"group_by": "length(name)",
+						"aggregate_function": "avg",
+						"aggregate_on": "`tabUser`.`name`",
+					}
+				),
+			)
+
+		with self.assertRaises(frappe.DataError):
+			_save_report(
+				"Test Invalid 3",
+				"User",
+				_settings(
+					{
+						"group_by": "`tabUser`.`user_type`",
+						"aggregate_function": "SLEEP(5)",
+						"aggregate_on": "`tabUser`.`name`",
+					}
+				),
+			)
+
+		with self.assertRaises(frappe.DataError):
+			_save_report(
+				"Test Invalid 4",
+				"User",
+				_settings(
+					{
+						"group_by": "`tabUser`.`user_type`",
+						"aggregate_function": "sum",
+						"aggregate_on": "`tabUser`.`nonexistent_field`",
+					}
+				),
+			)
+
+		with self.assertRaises(frappe.DataError):
+			_save_report(
+				"Test Invalid 5",
+				"User",
+				_settings(
+					{
+						"group_by": "`tabFakeDoctype`.`name`",
+						"aggregate_function": "count",
+					}
+				),
+			)
+
+		with self.assertRaises(frappe.DataError):
+			_save_report(
+				"Test Invalid 6",
+				"User",
+				_settings(
+					{
+						"group_by": "`tabUser`.`user_type`",
+						"aggregate_function": ["sum"],
+						"aggregate_on": "`tabUser`.`name`",
+					}
+				),
+			)
+
+		with self.assertRaises(frappe.DataError):
+			_save_report(
+				"Test Invalid 7",
+				"User",
+				_settings(
+					{
+						"group_by": "`tabUser`.`user_type`",
+						"aggregate_function": None,
+						"aggregate_on": "`tabUser`.`name`",
+					}
+				),
+			)
+
+		# valid cases
+
+		try:
+			report_name = _save_report(
+				"Test Valid 1",
+				"User",
+				_settings(
+					{
+						"group_by": "`tabUser`.`user_type`",
+						"aggregate_function": "avg",
+						"aggregate_on": "`tabUser`.`name`",
+					}
+				),
+			)
+			self.assertTrue(frappe.db.exists("Report", report_name))
+
+			_save_report(
+				report_name,
+				"User",
+				_settings(
+					{
+						"group_by": "`tabUser`.`user_type`",
+						"aggregate_function": "sum",
+						"aggregate_on": "`tabUser`.`name`",
+					}
+				),
+			)
+
+			_save_report(
+				report_name,
+				"User",
+				_settings(
+					{
+						"group_by": "`tabUser`.`user_type`",
+						"aggregate_function": "count",
+					}
+				),
+			)
+
+			list_report_name = _save_report(
+				"Test Valid 2",
+				"User",
+				json.dumps([{"fieldname": "email", "fieldtype": "Data", "label": "Email"}]),
+			)
+			self.assertTrue(frappe.db.exists("Report", list_report_name))
+
+		finally:
+			frappe.db.rollback()
